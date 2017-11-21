@@ -12,25 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// The trillian_log_signer binary runs the log signing code.
 package main
 
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql" // Load MySQL driver
-
 	"github.com/golang/glog"
-	"github.com/google/trillian/crypto/keys"
+	"github.com/google/trillian/cmd"
 	"github.com/google/trillian/extension"
-	"github.com/google/trillian/monitoring/metric"
+	"github.com/google/trillian/log"
+	"github.com/google/trillian/monitoring/prometheus"
 	"github.com/google/trillian/server"
 	"github.com/google/trillian/storage/mysql"
 	"github.com/google/trillian/util"
 	"github.com/google/trillian/util/etcd"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/context"
+
+	// Load MySQL driver
+	_ "github.com/go-sql-driver/mysql"
+	// Register key ProtoHandlers
+	_ "github.com/google/trillian/crypto/keys/der/proto"
+	_ "github.com/google/trillian/crypto/keys/pem/proto"
+	_ "github.com/google/trillian/crypto/keys/pkcs11/proto"
+	// Load hashers
+	_ "github.com/google/trillian/merkle/objhasher"
+	_ "github.com/google/trillian/merkle/rfc6962"
 )
 
 var (
@@ -40,27 +52,35 @@ var (
 	batchSizeFlag            = flag.Int("batch_size", 50, "Max number of leaves to process per batch")
 	numSeqFlag               = flag.Int("num_sequencers", 10, "Number of sequencer workers to run in parallel")
 	sequencerGuardWindowFlag = flag.Duration("sequencer_guard_window", 0, "If set, the time elapsed before submitted leaves are eligible for sequencing")
-	dumpMetricsInterval      = flag.Duration("dump_metrics_interval", 0, "If greater than 0, how often to dump metrics to the logs.")
 	forceMaster              = flag.Bool("force_master", false, "If true, assume master for all logs")
-	etcdServers              = flag.String("etcd_servers", "localhost:2379", "A comma-separated list of etcd servers")
+	etcdServers              = flag.String("etcd_servers", "", "A comma-separated list of etcd servers")
+	etcdHTTPService          = flag.String("etcd_http_service", "trillian-logsigner-http", "Service name to announce our HTTP endpoint under")
 	lockDir                  = flag.String("lock_file_path", "/test/multimaster", "etcd lock file directory path")
+
+	quotaSystem         = flag.String("quota_system", "mysql", "Quota system to use. One of: \"noop\", \"mysql\" or \"etcd\"")
+	quotaIncreaseFactor = flag.Float64("quota_increase_factor", log.QuotaIncreaseFactor,
+		"Increase factor for tokens replenished by sequencing-based quotas (1 means a 1:1 relationship between sequenced leaves and replenished tokens)."+
+			"Only effective for --quota_system=etcd.")
 
 	preElectionPause    = flag.Duration("pre_election_pause", 1*time.Second, "Maximum time to wait before starting elections")
 	masterCheckInterval = flag.Duration("master_check_interval", 5*time.Second, "Interval between checking mastership still held")
 	masterHoldInterval  = flag.Duration("master_hold_interval", 60*time.Second, "Minimum interval to hold mastership for")
 	resignOdds          = flag.Int("resign_odds", 10, "Chance of resigning mastership after each check, the N in 1-in-N")
+
+	configFile = flag.String("config", "", "Config file containing flags, file contents can be overridden by command line flags")
 )
 
 func main() {
 	flag.Parse()
+
+	if *configFile != "" {
+		if err := cmd.ParseFlagFile(*configFile); err != nil {
+			glog.Exitf("Failed to load flags from config file %q: %s", *configFile, err)
+		}
+	}
+
 	glog.CopyStandardLogTo("WARNING")
 	glog.Info("**** Log Signer Starting ****")
-
-	// Enable dumping of metrics to the log at regular interval,
-	// if requested.
-	if *dumpMetricsInterval > 0 {
-		go metric.DumpToLog(context.Background(), *dumpMetricsInterval)
-	}
 
 	// First make sure we can access the database, quit if not
 	db, err := mysql.OpenDB(*mySQLURI)
@@ -69,29 +89,54 @@ func main() {
 	}
 	defer db.Close()
 
+	client, err := etcd.NewClient(*etcdServers)
+	if err != nil {
+		glog.Exitf("Failed to connect to etcd at %v: %v", etcdServers, err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	go util.AwaitSignal(cancel)
 
 	hostname, _ := os.Hostname()
 	instanceID := fmt.Sprintf("%s.%d", hostname, os.Getpid())
 	var electionFactory util.ElectionFactory
-	if *forceMaster {
+	switch {
+	case *forceMaster:
 		glog.Warning("**** Acting as master for all logs ****")
 		electionFactory = util.NoopElectionFactory{InstanceID: instanceID}
-	} else {
-		electionFactory = etcd.NewElectionFactory(instanceID, *etcdServers, *lockDir)
+	case client != nil:
+		electionFactory = etcd.NewElectionFactory(instanceID, client, *lockDir)
+	default:
+		glog.Exit("Either --force_master or --etcd_servers must be supplied")
 	}
+
+	qm, err := server.NewQuotaManager(&server.QuotaParams{
+		QuotaSystem: *quotaSystem,
+		DB:          db,
+		Client:      client,
+	})
+	if err != nil {
+		glog.Exitf("Error creating quota manager: %v", err)
+	}
+
+	mf := prometheus.MetricFactory{}
 
 	registry := extension.Registry{
 		AdminStorage:    mysql.NewAdminStorage(db),
-		SignerFactory:   keys.PEMSignerFactory{},
-		LogStorage:      mysql.NewLogStorage(db),
+		LogStorage:      mysql.NewLogStorage(db, mf),
 		ElectionFactory: electionFactory,
+		QuotaManager:    qm,
+		MetricFactory:   mf,
 	}
 
 	// Start HTTP server (optional)
 	if *httpEndpoint != "" {
+		// Announce our endpoint to etcd if so configured.
+		unannounceHTTP := server.AnnounceSelf(ctx, client, *etcdHTTPService, *httpEndpoint)
+		defer unannounceHTTP()
+
 		glog.Infof("Creating HTTP server starting on %v", *httpEndpoint)
+		http.Handle("/metrics", promhttp.Handler())
 		if err := util.StartHTTPServer(*httpEndpoint); err != nil {
 			glog.Exitf("Failed to start HTTP server on %v: %v", *httpEndpoint, err)
 		}
@@ -100,6 +145,7 @@ func main() {
 	// Start the sequencing loop, which will run until we terminate the process. This controls
 	// both sequencing and signing.
 	// TODO(Martin2112): Should respect read only mode and the flags in tree control etc
+	log.QuotaIncreaseFactor = *quotaIncreaseFactor
 	sequencerManager := server.NewSequencerManager(registry, *sequencerGuardWindowFlag)
 	info := server.LogOperationInfo{
 		Registry:            registry,

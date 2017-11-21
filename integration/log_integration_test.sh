@@ -1,65 +1,54 @@
 #!/bin/bash
 set -e
 INTEGRATION_DIR="$( cd "$( dirname "$0" )" && pwd )"
-. "${INTEGRATION_DIR}"/common.sh
+. "${INTEGRATION_DIR}"/functions.sh
 
-echo "Building code"
-go build ${GOFLAGS} ./cmd/createtree/
-go build ${GOFLAGS} ./server/trillian_log_server/
-go build ${GOFLAGS} ./server/trillian_log_signer/
+echo "Launching core Trillian log components"
+log_prep_test 1 1
 
-yes | "${SCRIPTS_DIR}"/resetdb.sh
+# Cleanup for the Trillian components
+TO_DELETE="${TO_DELETE} ${ETCD_DB_DIR}"
+TO_KILL+=(${LOG_SIGNER_PIDS[@]})
+TO_KILL+=(${RPC_SERVER_PIDS[@]})
+TO_KILL+=(${ETCD_PID})
 
-RPC_PORT=$(pickUnusedPort)
+if [[ "${WITH_PKCS11}" == "true" ]]; then
+  echo 0:${TMPDIR}/softhsm-slot0.db > ${SOFTHSM_CONF}
+  softhsm --slot 0 --init-token --label log --pin 1234 --so-pin 5678
+  softhsm --slot 0 --import testdata/log-rpc-server-pkcs11.privkey.pem --label log_key --pin 1234 --id BEEF
+  KEY_ARGS="--private_key_format=PKCS11ConfigFile --pkcs11_config_path=testdata/pkcs11-conf.json --signature_algorithm=RSA"
+else
+  KEY_ARGS="--private_key_format=PrivateKey --pem_key_path=testdata/log-rpc-server.privkey.pem --pem_key_password=towel --signature_algorithm=ECDSA"
+fi
 
-echo "Starting Log RPC server on localhost:${RPC_PORT}"
-pushd "${TRILLIAN_ROOT}" > /dev/null
-./trillian_log_server --rpc_endpoint="localhost:${RPC_PORT}" --http_endpoint='' &
-RPC_SERVER_PID=$!
-popd > /dev/null
-waitForServerStartup ${RPC_PORT}
-
+echo "Provision log"
+go build ${GOFLAGS} github.com/google/trillian/cmd/createtree/
 TEST_TREE_ID=$(./createtree \
-  --admin_server="localhost:${RPC_PORT}" \
-  --pem_key_path=testdata/log-rpc-server.privkey.pem \
-  --pem_key_password=towel \
-  --signature_algorithm=ECDSA)
+  --admin_server="${RPC_SERVER_1}" \
+  ${KEY_ARGS})
 echo "Created tree ${TEST_TREE_ID}"
 
-# Ensure we kill the RPC server once we're done.
-TO_KILL+=(${RPC_SERVER_PID})
-waitForServerStartup ${RPC_PORT}
-
-echo "Starting Log signer"
-pushd "${TRILLIAN_ROOT}" > /dev/null
-./trillian_log_signer --sequencer_interval="1s" --batch_size=100 --http_endpoint='' --force_master &
-LOG_SIGNER_PID=$!
-TO_KILL+=(${LOG_SIGNER_PID})
-popd > /dev/null
-
-# Run the test(s):
-cd "${INTEGRATION_DIR}"
+echo "Running test"
+pushd "${INTEGRATION_DIR}"
 set +e
-go test -run ".*LiveLog.*" --timeout=5m ./ --treeid ${TEST_TREE_ID} --log_rpc_server="localhost:${RPC_PORT}"
+TRILLIAN_SQL_DRIVER=mysql go test ${GOFLAGS} \
+  -run ".*LiveLog.*" \
+  -timeout=${GO_TEST_TIMEOUT:-5m} \
+  ./ --log_rpc_server="${RPC_SERVER_1}" --treeid ${TEST_TREE_ID}
 RESULT=$?
 set -e
+popd
 
-echo "Stopping Log signer (pid ${LOG_SIGNER_PID})"
-killPid ${LOG_SIGNER_PID}
-echo "Stopping Log RPC server (pid ${RPC_SERVER_PID})"
-killPid ${RPC_SERVER_PID}
+log_stop_test
 TO_KILL=()
 
 if [ $RESULT != 0 ]; then
-    sleep 1
-    if [ "$TMPDIR" == "" ]; then
-        TMPDIR=/tmp
-    fi
-    echo "Server log:"
-    echo "--------------------"
-    cat "${TMPDIR}"/trillian_log_server.INFO
-    echo "Signer log:"
-    echo "--------------------"
-    cat "${TMPDIR}"/trillian_log_signer.INFO
-    exit $RESULT
+  sleep 1
+  echo "Server log:"
+  echo "--------------------"
+  cat "${TMPDIR}"/trillian_log_server.INFO
+  echo "Signer log:"
+  echo "--------------------"
+  cat "${TMPDIR}"/trillian_log_signer.INFO
+  exit $RESULT
 fi

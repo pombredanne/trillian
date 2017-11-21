@@ -16,6 +16,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 
 	"github.com/google/trillian"
 )
@@ -54,6 +55,11 @@ type MapTreeTX interface {
 	Getter
 	Setter
 }
+
+// ErrMapNeedsInit is an error returned from SnapshotForTree / BeginForTree when used
+// on a uninitialized map storage - i.e. a new, empty map in which the Revision 0 SMH
+// hasn't yet been created.
+var ErrMapNeedsInit = errors.New("Uninitialized map")
 
 // ReadOnlyMapStorage provides a narrow read-only view into a MapStorage.
 type ReadOnlyMapStorage interface {
@@ -98,6 +104,9 @@ type Getter interface {
 
 // MapRootReader provides access to the map roots.
 type MapRootReader interface {
+	// GetSignedMapRoot returns the SignedMapRoot associated with the
+	// specified revision.
+	GetSignedMapRoot(ctx context.Context, revision int64) (trillian.SignedMapRoot, error)
 	// LatestSignedMapRoot returns the most recently created SignedMapRoot.
 	LatestSignedMapRoot(ctx context.Context) (trillian.SignedMapRoot, error)
 }

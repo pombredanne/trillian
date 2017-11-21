@@ -27,7 +27,7 @@ import (
 	"github.com/google/trillian"
 	"github.com/google/trillian/client/backoff"
 	"github.com/google/trillian/merkle"
-	"google.golang.org/genproto/googleapis/rpc/code"
+	"github.com/google/trillian/merkle/hashers"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -37,10 +37,11 @@ type LogClient struct {
 	LogID  int64
 	client trillian.TrillianLogClient
 	*logVerifier
+	root trillian.SignedLogRoot
 }
 
 // New returns a new LogClient.
-func New(logID int64, client trillian.TrillianLogClient, hasher merkle.TreeHasher, pubKey crypto.PublicKey) *LogClient {
+func New(logID int64, client trillian.TrillianLogClient, hasher hashers.LogHasher, pubKey crypto.PublicKey) *LogClient {
 	return &LogClient{
 		LogID:  logID,
 		client: client,
@@ -52,42 +53,22 @@ func New(logID int64, client trillian.TrillianLogClient, hasher merkle.TreeHashe
 	}
 }
 
+// Root returns the last valid root seen by UpdateRoot.
+// Returns an empty SignedLogRoot if UpdateRoot has not been called.
+func (c *LogClient) Root() trillian.SignedLogRoot {
+	return c.root
+}
+
 // AddLeaf adds leaf to the append only log.
 // Blocks until it gets a verifiable response.
 func (c *LogClient) AddLeaf(ctx context.Context, data []byte) error {
-	// Fetch the current Root so we can detect when we update.
-	if err := c.UpdateRoot(ctx); err != nil {
-		return err
+	if err := c.QueueLeaf(ctx, data); err != nil {
+		return fmt.Errorf("QueueLeaf(): %v", err)
 	}
-
-	leaf := c.logVerifier.buildLeaf(data)
-	err := c.queueLeaf(ctx, leaf)
-	switch s, ok := status.FromError(err); {
-	case ok && s.Code() == codes.AlreadyExists:
-		// If the leaf already exists, don't wait for an update.
-		return c.getInclusionProof(ctx, leaf.MerkleLeafHash, c.root.TreeSize)
-	case err != nil:
-		return err
-	default:
-		err := status.Errorf(codes.NotFound, "Pre-loop condition")
-		for {
-			if ctx.Err() != nil {
-				break
-			}
-			if s, ok := status.FromError(err); !ok || s.Code() != codes.NotFound {
-				break
-			}
-
-			// Wait for TreeSize to update.
-			if err := c.waitForRootUpdate(ctx); err != nil {
-				return err
-			}
-
-			// Get proof by hash.
-			err = c.getInclusionProof(ctx, leaf.MerkleLeafHash, c.root.TreeSize)
-		}
-		return err
+	if err := c.WaitForInclusion(ctx, data); err != nil {
+		return fmt.Errorf("WaitForInclusion(): %v", err)
 	}
+	return nil
 }
 
 // GetByIndex returns a single leaf at the requested index.
@@ -185,7 +166,7 @@ func (c *LogClient) UpdateRoot(ctx context.Context) error {
 	}
 	// Fetch a consistency proof if this isn't the first root we've seen.
 	var consistency *trillian.GetConsistencyProofResponse
-	if c.root.TreeSize != 0 {
+	if c.root.TreeSize > 0 {
 		// Get consistency proof.
 		consistency, err = c.client.GetConsistencyProof(ctx,
 			&trillian.GetConsistencyProofRequest{
@@ -197,17 +178,68 @@ func (c *LogClient) UpdateRoot(ctx context.Context) error {
 			return err
 		}
 	}
-
-	// Verify root update.
-	if err := c.logVerifier.UpdateRoot(resp, consistency); err != nil {
-		return err
+	// Verify root update if the tree / the latest signed log root isn't empty.
+	if resp.GetSignedLogRoot().GetTreeSize() > 0 {
+		if err := c.logVerifier.VerifyRoot(&c.root, resp.GetSignedLogRoot(),
+			consistency.GetProof().GetHashes()); err != nil {
+			return err
+		}
+		c.root = *resp.SignedLogRoot
 	}
 	return nil
 }
 
+// WaitForInclusion blocks until the requested data has been verified with an inclusion proof.
+// This assumes that the data has already been submitted.
+// Best practice is to call this method with a context that will timeout.
+func (c *LogClient) WaitForInclusion(ctx context.Context, data []byte) error {
+	leaf, err := c.logVerifier.buildLeaf(data)
+	if err != nil {
+		return err
+	}
+
+	// Fetch the current Root to improve our chances at a valid inclusion proof.
+	if err := c.UpdateRoot(ctx); err != nil {
+		return err
+	}
+	if c.root.TreeSize == 0 {
+		// If the TreeSize is 0, wait for something to be in the log.
+		// It is illegal to ask for an inclusion proof with TreeSize = 0.
+		if err := c.waitForRootUpdate(ctx); err != nil {
+			return err
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		err := c.getInclusionProof(ctx, leaf.MerkleLeafHash, c.root.TreeSize)
+		s, ok := status.FromError(err)
+		if !ok {
+			return err
+		}
+		switch s.Code() {
+		case codes.OK:
+			return nil
+		case codes.NotFound:
+			// Wait for TreeSize to update.
+			if err := c.waitForRootUpdate(ctx); err != nil {
+				return err
+			}
+		default:
+			return err
+		}
+	}
+}
+
 // VerifyInclusion updates the log root and ensures that the given leaf data has been included in the log.
 func (c *LogClient) VerifyInclusion(ctx context.Context, data []byte) error {
-	leaf := c.logVerifier.buildLeaf(data)
+	leaf, err := c.logVerifier.buildLeaf(data)
+	if err != nil {
+		return err
+	}
 	if err := c.UpdateRoot(ctx); err != nil {
 		return fmt.Errorf("UpdateRoot(): %v", err)
 	}
@@ -228,7 +260,7 @@ func (c *LogClient) VerifyInclusionAtIndex(ctx context.Context, data []byte, ind
 	if err != nil {
 		return err
 	}
-	return c.logVerifier.VerifyInclusionAtIndex(data, index, resp)
+	return c.logVerifier.VerifyInclusionAtIndex(&c.root, data, index, resp.Proof.Hashes)
 }
 
 func (c *LogClient) getInclusionProof(ctx context.Context, leafHash []byte, treeSize int64) error {
@@ -245,26 +277,26 @@ func (c *LogClient) getInclusionProof(ctx context.Context, leafHash []byte, tree
 		return errors.New("no inclusion proof supplied")
 	}
 	for _, proof := range resp.Proof {
-		if err := c.logVerifier.VerifyInclusionByHash(leafHash, proof); err != nil {
+		if err := c.logVerifier.VerifyInclusionByHash(&c.root, leafHash, proof); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *LogClient) queueLeaf(ctx context.Context, leaf *trillian.LogLeaf) error {
-	// Queue Leaf
-	req := trillian.QueueLeafRequest{
-		LogId: c.LogID,
-		Leaf:  leaf,
-	}
-	rsp, err := c.client.QueueLeaf(ctx, &req)
+// QueueLeaf adds a leaf to a Trillian log without blocking.
+// AlreadyExists is considered a success case by this function.
+func (c *LogClient) QueueLeaf(ctx context.Context, data []byte) error {
+	leaf, err := c.logVerifier.buildLeaf(data)
 	if err != nil {
 		return err
 	}
-	if rsp.QueuedLeaf.Status != nil && rsp.QueuedLeaf.Status.Code == int32(code.Code_ALREADY_EXISTS) {
-		// Convert this to AlreadyExists
-		return status.Errorf(codes.AlreadyExists, "leaf already exists")
+
+	if _, err := c.client.QueueLeaf(ctx, &trillian.QueueLeafRequest{
+		LogId: c.LogID,
+		Leaf:  leaf,
+	}); err != nil {
+		return err
 	}
 	return nil
 }

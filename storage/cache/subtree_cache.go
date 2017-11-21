@@ -18,11 +18,9 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"math/big"
 	"sync"
 
 	"github.com/golang/glog"
-	"github.com/google/trillian/merkle"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/storagepb"
 )
@@ -57,6 +55,8 @@ const (
 	depthQuantum = 8
 	// logStrataDepth is the strata that must be used for all log subtrees.
 	logStrataDepth = 8
+	// maxLogDepth is the number of bits in a log path.
+	maxLogDepth = 64
 )
 
 // SubtreeCache provides a caching access to Subtree storage. Currently there are assumptions
@@ -79,22 +79,6 @@ type SubtreeCache struct {
 	populate storage.PopulateSubtreeFunc
 	// prepare is used for preparation work when subtrees are about to be written to storage.
 	prepare storage.PrepareSubtreeWriteFunc
-}
-
-// Suffix represents the tail of a NodeID, indexing into the Subtree which
-// corresponds to the prefix of the NodeID.
-type Suffix struct {
-	// bits is the number of bits in the node ID suffix.
-	bits byte
-	// path is the suffix itself.
-	path []byte
-}
-
-func (s Suffix) serialize() string {
-	r := make([]byte, 1, 1+(len(s.path)))
-	r[0] = s.bits
-	r = append(r, s.path...)
-	return base64.StdEncoding.EncodeToString(r)
 }
 
 // NewSubtreeCache returns a newly intialised cache ready for use.
@@ -145,23 +129,9 @@ func (s *SubtreeCache) stratumInfoForPrefixLength(numBits int) stratumInfo {
 
 // splitNodeID breaks a NodeID out into its prefix and suffix parts.
 // unless ID is 0 bits long, Suffix must always contain at least one bit.
-func (s *SubtreeCache) splitNodeID(id storage.NodeID) ([]byte, Suffix) {
-	if id.PrefixLenBits == 0 {
-		return []byte{}, Suffix{bits: 0, path: []byte{0}}
-	}
-	a := make([]byte, len(id.Path))
-	copy(a, id.Path)
+func (s *SubtreeCache) splitNodeID(id storage.NodeID) ([]byte, storage.Suffix) {
 	sInfo := s.stratumInfoForPrefixLength(id.PrefixLenBits - 1)
-	prefixSplit := sInfo.prefixBytes
-	sfx := Suffix{
-		bits: byte((id.PrefixLenBits-1)%sInfo.depth) + 1,
-		path: a[prefixSplit : prefixSplit+sInfo.depth/depthQuantum],
-	}
-	maskIndex := int((sfx.bits - 1) / depthQuantum)
-	maskLowBits := (sfx.bits-1)%depthQuantum + 1
-	sfx.path[maskIndex] &= ((0x01 << maskLowBits) - 1) << uint(depthQuantum-maskLowBits)
-
-	return a[:prefixSplit], sfx
+	return id.Split(sInfo.prefixBytes, sInfo.depth)
 }
 
 // preload calculates the set of subtrees required to know the hashes of the
@@ -225,6 +195,11 @@ func (s *SubtreeCache) preload(ids []storage.NodeID, getSubtrees GetSubtreesFunc
 // GetNodes returns the requested nodes, calling the getSubtrees function if
 // they are not already cached.
 func (s *SubtreeCache) GetNodes(ids []storage.NodeID, getSubtrees GetSubtreesFunc) ([]storage.Node, error) {
+	if glog.V(4) {
+		for _, n := range ids {
+			glog.Infof("cache: GetNodes(%x, %d", n.Path, n.PrefixLenBits)
+		}
+	}
 	if err := s.preload(ids, getSubtrees); err != nil {
 		return nil, err
 	}
@@ -273,6 +248,7 @@ func (s *SubtreeCache) getNodeHashUnderLock(id storage.NodeID, getSubtree GetSub
 	prefixKey := string(px)
 	c := s.subtrees[prefixKey]
 	if c == nil {
+		glog.Infof("Cache miss for %x so we'll try to fetch from storage", prefixKey)
 		// Cache miss, so we'll try to fetch from storage.
 		subID := id
 		subID.PrefixLenBits = len(px) * depthQuantum // this won't work if depthQuantum changes
@@ -305,10 +281,18 @@ func (s *SubtreeCache) getNodeHashUnderLock(id storage.NodeID, getSubtree GetSub
 	// have a fixed depth if the suffix has the same number of significant bits as the
 	// subtree depth then this is a leaf. For example if the subtree is depth 8 its leaves
 	// have 8 significant suffix bits.
-	if int32(sx.bits) == c.Depth {
-		nh = c.Leaves[sx.serialize()]
+	sfxKey := sx.String()
+	if int32(sx.Bits) == c.Depth {
+		nh = c.Leaves[sfxKey]
 	} else {
-		nh = c.InternalNodes[sx.serialize()]
+		nh = c.InternalNodes[sfxKey]
+	}
+	if glog.V(4) {
+		b, err := base64.StdEncoding.DecodeString(sfxKey)
+		if err != nil {
+			glog.Errorf("base64.DecodeString(%v): %v", sfxKey, err)
+		}
+		glog.Infof("getNodeHashUnderLock(%x | %x): %x", prefixKey, b, nh)
 	}
 	if nh == nil {
 		return nil, nil
@@ -345,10 +329,18 @@ func (s *SubtreeCache) SetNodeHash(id storage.NodeID, h []byte, getSubtree GetSu
 	s.dirtyPrefixes[prefixKey] = true
 	// Determine whether we're being asked to store a leaf node, or an internal
 	// node, and store it accordingly.
-	if int32(sx.bits) == c.Depth {
-		c.Leaves[sx.serialize()] = h
+	sfxKey := sx.String()
+	if int32(sx.Bits) == c.Depth {
+		c.Leaves[sfxKey] = h
 	} else {
-		c.InternalNodes[sx.serialize()] = h
+		c.InternalNodes[sfxKey] = h
+	}
+	if glog.V(4) {
+		b, err := base64.StdEncoding.DecodeString(sfxKey)
+		if err != nil {
+			glog.Errorf("base64.DecodeString(%v): %v", sfxKey, err)
+		}
+		glog.Infof("SetNodeHash(pfx: %x, sfx: %x): %x", prefixKey, b, h)
 	}
 	return nil
 }
@@ -386,7 +378,7 @@ func (s *SubtreeCache) Flush(setSubtrees SetSubtreesFunc) error {
 
 func (s *SubtreeCache) newEmptySubtree(id storage.NodeID, px []byte) *storagepb.SubtreeProto {
 	sInfo := s.stratumInfoForPrefixLength(id.PrefixLenBits)
-	glog.V(1).Infof("Creating new empty subtree for %v, with depth %d", px, sInfo.depth)
+	glog.V(1).Infof("Creating new empty subtree for %x, with depth %d", px, sInfo.depth)
 	// storage didn't have one for us, so we'll store an empty proto here
 	// incase we try to update it later on (we won't flush it back to
 	// storage unless it's been written to.)
@@ -395,181 +387,5 @@ func (s *SubtreeCache) newEmptySubtree(id storage.NodeID, px []byte) *storagepb.
 		Depth:         int32(sInfo.depth),
 		Leaves:        make(map[string][]byte),
 		InternalNodes: make(map[string][]byte),
-	}
-}
-
-// makeSuffixKey creates a suffix key for indexing into the subtree's Leaves and
-// InternalNodes maps.
-func makeSuffixKey(depth int, index int64) (string, error) {
-	if depth < 0 {
-		return "", fmt.Errorf("invalid negative depth of %d", depth)
-	}
-	if index < 0 {
-		return "", fmt.Errorf("invalid negative index %d", index)
-	}
-	sfx := Suffix{byte(depth), []byte{byte(index)}}
-	return sfx.serialize(), nil
-}
-
-// PopulateMapSubtreeNodes re-creates Map subtree's InternalNodes from the
-// subtree Leaves map.
-//
-// This uses HStar2 to repopulate internal nodes.
-func PopulateMapSubtreeNodes(treeHasher merkle.TreeHasher) storage.PopulateSubtreeFunc {
-	return func(st *storagepb.SubtreeProto) error {
-		st.InternalNodes = make(map[string][]byte)
-		rootID := storage.NewNodeIDFromHash(st.Prefix)
-		fullTreeDepth := treeHasher.Size() * depthQuantum
-		leaves := make([]merkle.HStar2LeafHash, 0, len(st.Leaves))
-		for k64, v := range st.Leaves {
-			k, err := base64.StdEncoding.DecodeString(k64)
-			if err != nil {
-				return err
-			}
-			if k[0]%depthQuantum != 0 {
-				return fmt.Errorf("unexpected non-leaf suffix found: %x", k)
-			}
-			leaves = append(leaves, merkle.HStar2LeafHash{
-				LeafHash: v,
-				Index:    big.NewInt(int64(k[1])),
-			})
-		}
-		hs2 := merkle.NewHStar2(treeHasher)
-		offset := fullTreeDepth - rootID.PrefixLenBits - int(st.Depth)
-		root, err := hs2.HStar2Nodes(int(st.Depth), offset, leaves,
-			func(depth int, index *big.Int) ([]byte, error) {
-				return nil, nil
-			},
-			func(depth int, index *big.Int, h []byte) error {
-				i := index.Int64()
-				sfx, err := makeSuffixKey(depth, i)
-				if err != nil {
-					return err
-				}
-				st.InternalNodes[sfx] = h
-				return nil
-			})
-		if err != nil {
-			return err
-		}
-		st.RootHash = root
-		return err
-	}
-}
-
-// PopulateLogSubtreeNodes re-creates a Log subtree's InternalNodes from the
-// subtree Leaves map.
-//
-// This uses the CompactMerkleTree to repopulate internal nodes, and so will
-// handle imperfect (but left-hand dense) subtrees. Note that we only rebuild internal
-// nodes when the subtree is fully populated. For an explanation of why see the comments
-// below for PrepareLogSubtreeWrite.
-func PopulateLogSubtreeNodes(treeHasher merkle.TreeHasher) storage.PopulateSubtreeFunc {
-	return func(st *storagepb.SubtreeProto) error {
-		cmt := merkle.NewCompactMerkleTree(treeHasher)
-		if st.Depth < 1 {
-			return fmt.Errorf("populate log subtree with invalid depth: %d", st.Depth)
-		}
-		// maxLeaves is the number of leaves that fully populates a subtree of the depth we are
-		// working with.
-		maxLeaves := 1 << uint(st.Depth)
-
-		// If the subtree is fully populated then the internal node map is expected to be nil but in
-		// case it isn't we recreate it as we're about to rebuild the contents. We'll check
-		// below that the number of nodes is what we expected to have.
-		if st.InternalNodes == nil || len(st.Leaves) == maxLeaves {
-			st.InternalNodes = make(map[string][]byte)
-		}
-
-		// We need to update the subtree root hash regardless of whether it's fully populated
-		for leafIndex := int64(0); leafIndex < int64(len(st.Leaves)); leafIndex++ {
-			sfx, err := makeSuffixKey(logStrataDepth, leafIndex)
-			if err != nil {
-				return err
-			}
-			h := st.Leaves[sfx]
-			if h == nil {
-				return fmt.Errorf("unexpectedly got nil for subtree leaf suffix %s", sfx)
-			}
-			seq, err := cmt.AddLeafHash(h, func(depth int, index int64, h []byte) error {
-				if depth == 8 && index == 0 {
-					// no space for the root in the node cache
-					return nil
-				}
-				key, err := makeSuffixKey(logStrataDepth-depth, index<<uint(depth))
-				if err != nil {
-					// This can only happen if we somehow ended up outside of the subtree. For example
-					// if more leaves were added to the CMT than the fully populated count for the strata
-					// depth.
-					return fmt.Errorf("bad suffix key in log repop: %v", err)
-				}
-				// Don't put leaves into the internal map and only update if we're rebuilding internal
-				// nodes. If the subtree was saved with internal nodes then we don't touch the map.
-				if depth > 0 && len(st.Leaves) == maxLeaves {
-					st.InternalNodes[key] = h
-				}
-				return nil
-			})
-			if err != nil {
-				return err
-			}
-			if got, expected := seq, leafIndex; got != expected {
-				return fmt.Errorf("got seq of %d, but expected %d", got, expected)
-			}
-		}
-		st.RootHash = cmt.CurrentRoot()
-
-		// Additional check - after population we should have the same number of internal nodes
-		// as before the subtree was written to storage. Either because they were loaded from
-		// storage or just rebuilt above.
-		if got, want := uint32(len(st.InternalNodes)), st.InternalNodeCount; got != want {
-			// TODO(Martin2112): Possibly replace this with stronger checks on the data in
-			// subtrees on disk so we can detect corruption.
-			return fmt.Errorf("log repop got: %d internal nodes, want: %d", got, want)
-		}
-
-		return nil
-	}
-}
-
-// PrepareMapSubtreeWrite prepares a map subtree for writing. For maps the internal
-// nodes are never written to storage and are thus always cleared.
-func PrepareMapSubtreeWrite() storage.PrepareSubtreeWriteFunc {
-	return func(st *storagepb.SubtreeProto) error {
-		st.InternalNodes = nil
-		// We don't check the node count for map subtrees but ensure it's zero for consistency
-		st.InternalNodeCount = 0
-		return nil
-	}
-}
-
-// PrepareLogSubtreeWrite prepares a log subtree for writing. If the subtree is fully
-// populated the internal nodes are cleared. Otherwise they are written.
-//
-// To see why this is necessary consider the case where a tree has a single full subtree
-// and then an additional leaf is added.
-//
-// This causes an extra level to be added to the tree with an internal node that is a hash
-// of the root of the left full subtree and the new leaf. Note that the leaves remain at
-// level zero in the overall tree coordinate space but they are now in a lower subtree stratum
-// than they were before the last node was added as the tree has grown above them.
-//
-// Thus in the case just discussed the internal nodes cannot be correctly reconstructed
-// in isolation when the tree is reloaded because of the dependency on another subtree.
-//
-// Fully populated subtrees don't have this problem because by definition they can only
-// contain internal nodes built from their own contents.
-func PrepareLogSubtreeWrite() storage.PrepareSubtreeWriteFunc {
-	return func(st *storagepb.SubtreeProto) error {
-		st.InternalNodeCount = uint32(len(st.InternalNodes))
-		if st.Depth < 1 {
-			return fmt.Errorf("prepare subtree for log write invalid depth: %d", st.Depth)
-		}
-		maxLeaves := 1 << uint(st.Depth)
-		// If the subtree is fully populated we can safely clear the internal nodes
-		if len(st.Leaves) == maxLeaves {
-			st.InternalNodes = nil
-		}
-		return nil
 	}
 }

@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+
+	"github.com/google/trillian/merkle/hashers"
 )
 
 // RootMismatchError occurs when an inclusion proof fails.
@@ -32,11 +34,11 @@ func (e RootMismatchError) Error() string {
 
 // LogVerifier verifies inclusion and consistency proofs for append only logs.
 type LogVerifier struct {
-	hasher TreeHasher
+	hasher hashers.LogHasher
 }
 
 // NewLogVerifier returns a new LogVerifier for a tree.
-func NewLogVerifier(hasher TreeHasher) LogVerifier {
+func NewLogVerifier(hasher hashers.LogHasher) LogVerifier {
 	return LogVerifier{
 		hasher: hasher,
 	}
@@ -93,9 +95,7 @@ func (v LogVerifier) RootFromInclusionProof(leafIndex, treeSize int64, proof [][
 		} else if cntIndex < lastIndex {
 			cntHash = v.hasher.HashChildren(cntHash, proof[proofIndex])
 			proofIndex++
-		} else {
-			// The sibling does not exist.
-		}
+		} // else the sibling does not exist.
 		cntIndex = parent(cntIndex)
 		lastIndex = parent(lastIndex)
 	}
@@ -174,9 +174,7 @@ func (v LogVerifier) VerifyConsistencyProof(snapshot1, snapshot2 int64, root1, r
 			// Test whether a sibling node to the right exists at this level.
 			node2Hash = v.hasher.HashChildren(node2Hash, proof[proofIndex])
 			proofIndex++
-		} else {
-			// The sibling does not exist.
-		}
+		} // else the sibling does not exist.
 
 		node = parent(node)
 		lastNode = parent(lastNode)

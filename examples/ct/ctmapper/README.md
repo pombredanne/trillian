@@ -14,7 +14,7 @@ which have that domain in their subject/SAN fields.
 # contents of storage/mysql/storage.sql
 yes | scripts/resetdb.sh
 
-go build ./server/vmap/trillian_map_server
+go build ./server/trillian_map_server
 go build ./examples/ct/ctmapper/mapper
 go build ./examples/ct/ctmapper/lookup
 
@@ -25,8 +25,6 @@ go build ./examples/ct/ctmapper/lookup
 go build ./cmd/createtree/
 tree_id=$(./createtree \
     --admin_server=localhost:8090 \
-    --pem_key_path=testdata/log-rpc-server.privkey.pem \
-    --pem_key_password=towel \
     --signature_algorithm=ECDSA)
 ./mapper \
     -source http://ct.googleapis.com/pilot \

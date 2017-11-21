@@ -15,203 +15,150 @@
 package main
 
 import (
+	"context"
 	"errors"
-	"net"
+	"flag"
 	"testing"
+	"time"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/any"
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/google/trillian"
+	"github.com/google/trillian/cmd/createtree/testonly"
 	"github.com/google/trillian/crypto/sigpb"
+	"github.com/google/trillian/util/flagsaver"
 	"github.com/kylelemons/godebug/pretty"
-	"golang.org/x/net/context"
-	"google.golang.org/grpc"
 )
 
-func TestRun(t *testing.T) {
-	pemKey := &trillian.PEMKeyFile{
-		Path:     "../../testdata/log-rpc-server.privkey.pem",
-		Password: "towel",
-	}
-	anyKey, err := ptypes.MarshalAny(pemKey)
+// defaultTree reflects all flag defaults with the addition of a valid private key.
+var defaultTree = &trillian.Tree{
+	TreeState:          trillian.TreeState_ACTIVE,
+	TreeType:           trillian.TreeType_LOG,
+	HashStrategy:       trillian.HashStrategy_RFC6962_SHA256,
+	HashAlgorithm:      sigpb.DigitallySigned_SHA256,
+	SignatureAlgorithm: sigpb.DigitallySigned_ECDSA,
+	PrivateKey:         mustMarshalAny(&empty.Empty{}),
+	MaxRootDuration:    ptypes.DurationProto(0 * time.Millisecond),
+}
+
+type testCase struct {
+	desc      string
+	setFlags  func()
+	createErr error
+	wantErr   bool
+	wantTree  *trillian.Tree
+}
+
+func mustMarshalAny(p proto.Message) *any.Any {
+	anyKey, err := ptypes.MarshalAny(p)
 	if err != nil {
-		t.Fatalf("Can't marshall pemKey: %v", err)
+		panic(err)
 	}
+	return anyKey
+}
 
-	// defaultTree reflects all flag defaults with the addition of a valid pk
-	defaultTree := &trillian.Tree{
-		TreeState:          trillian.TreeState_ACTIVE,
-		TreeType:           trillian.TreeType_LOG,
-		HashStrategy:       trillian.HashStrategy_RFC_6962,
-		HashAlgorithm:      sigpb.DigitallySigned_SHA256,
-		SignatureAlgorithm: sigpb.DigitallySigned_RSA,
-		PrivateKey:         anyKey,
-	}
-
-	server, lis, stopFn, err := startFakeServer()
-	if err != nil {
-		t.Fatalf("Error starting fake server: %v", err)
-	}
-	defer stopFn()
-
-	validOpts := newOptsFromFlags()
-	validOpts.addr = lis.Addr().String()
-	validOpts.pemKeyPath = pemKey.Path
-	validOpts.pemKeyPass = pemKey.Password
-
+func TestCreateTree(t *testing.T) {
 	nonDefaultTree := *defaultTree
 	nonDefaultTree.TreeType = trillian.TreeType_MAP
-	nonDefaultTree.SignatureAlgorithm = sigpb.DigitallySigned_ECDSA
+	nonDefaultTree.SignatureAlgorithm = sigpb.DigitallySigned_RSA
 	nonDefaultTree.DisplayName = "Llamas Map"
 	nonDefaultTree.Description = "For all your digital llama needs!"
 
-	nonDefaultOpts := *validOpts
-	nonDefaultOpts.treeType = nonDefaultTree.TreeType.String()
-	nonDefaultOpts.sigAlgorithm = nonDefaultTree.SignatureAlgorithm.String()
-	nonDefaultOpts.displayName = nonDefaultTree.DisplayName
-	nonDefaultOpts.description = nonDefaultTree.Description
-
-	emptyAddr := *validOpts
-	emptyAddr.addr = ""
-
-	invalidEnumOpts := *validOpts
-	invalidEnumOpts.treeType = "LLAMA!"
-
-	invalidKeyTypeOpts := *validOpts
-	invalidKeyTypeOpts.privateKeyType = "LLAMA!!"
-
-	emptyPEMPath := *validOpts
-	emptyPEMPath.pemKeyPath = ""
-
-	emptyPEMPass := *validOpts
-	emptyPEMPass.pemKeyPass = ""
-
-	tests := []struct {
-		desc      string
-		opts      *createOpts
-		createErr error
-		wantErr   bool
-		wantTree  *trillian.Tree
-	}{
+	runTest(t, []*testCase{
 		{
-			desc:     "validOpts",
-			opts:     validOpts,
+			desc: "validOpts",
+			// runTest sets mandatory options, so no need to provide a setFlags func.
 			wantTree: defaultTree,
 		},
 		{
-			desc:     "nonDefaultOpts",
-			opts:     &nonDefaultOpts,
+			desc: "nonDefaultOpts",
+			setFlags: func() {
+				*treeType = nonDefaultTree.TreeType.String()
+				*signatureAlgorithm = nonDefaultTree.SignatureAlgorithm.String()
+				*displayName = nonDefaultTree.DisplayName
+				*description = nonDefaultTree.Description
+			},
 			wantTree: &nonDefaultTree,
 		},
 		{
-			// No mandatory opts provided
-			desc:    "defaultOptsOnly",
-			opts:    newOptsFromFlags(),
-			wantErr: true,
+			desc: "mandatoryOptsNotSet",
+			// Undo the flags set by runTest, so that mandatory options are no longer set.
+			setFlags: resetFlags,
+			wantErr:  true,
 		},
 		{
-			desc:    "emptyAddr",
-			opts:    &emptyAddr,
-			wantErr: true,
+			desc:     "emptyAddr",
+			setFlags: func() { *adminServerAddr = "" },
+			wantErr:  true,
 		},
 		{
-			desc:    "invalidEnumOpts",
-			opts:    &invalidEnumOpts,
-			wantErr: true,
+			desc:     "invalidEnumOpts",
+			setFlags: func() { *treeType = "LLAMA!" },
+			wantErr:  true,
 		},
 		{
-			desc:    "invalidKeyTypeOpts",
-			opts:    &invalidKeyTypeOpts,
-			wantErr: true,
-		},
-		{
-			desc:    "emptyPEMPath",
-			opts:    &emptyPEMPath,
-			wantErr: true,
-		},
-		{
-			desc:    "emptyPEMPass",
-			opts:    &emptyPEMPass,
-			wantErr: true,
+			desc:     "invalidKeyTypeOpts",
+			setFlags: func() { *privateKeyFormat = "LLAMA!!" },
+			wantErr:  true,
 		},
 		{
 			desc:      "createErr",
-			opts:      validOpts,
 			createErr: errors.New("create tree failed"),
 			wantErr:   true,
 		},
+	})
+}
+
+// runTest executes the createtree command against a fake TrillianAdminServer
+// for each of the provided tests, and checks that the tree in the request is
+// as expected, or an expected error occurs.
+// Prior to each test case, it:
+// 1. Resets all flags to their original values.
+// 2. Sets the adminServerAddr flag to point to the fake server.
+// 3. Calls the test's setFlags func (if provided) to allow it to change flags specific to the test.
+func runTest(t *testing.T, tests []*testCase) {
+	server := &testonly.FakeAdminServer{
+		GeneratedKey: defaultTree.PrivateKey,
 	}
+
+	lis, stopFakeServer, err := testonly.StartFakeAdminServer(server)
+	if err != nil {
+		t.Fatalf("Error starting fake server: %v", err)
+	}
+	defer stopFakeServer()
 
 	ctx := context.Background()
 	for _, test := range tests {
-		server.err = test.createErr
+		t.Run(test.desc, func(t *testing.T) {
+			defer flagsaver.Save().Restore()
+			*adminServerAddr = lis.Addr().String()
+			if test.setFlags != nil {
+				test.setFlags()
+			}
 
-		tree, err := createTree(ctx, test.opts)
-		switch hasErr := err != nil; {
-		case hasErr != test.wantErr:
-			t.Errorf("%v: createTree() returned err = '%v', wantErr = %v", test.desc, err, test.wantErr)
-			continue
-		case hasErr:
-			continue
-		}
+			server.Err = test.createErr
 
-		if diff := pretty.Compare(tree, test.wantTree); diff != "" {
-			t.Errorf("%v: post-createTree diff:\n%v", test.desc, diff)
-		}
+			tree, err := createTree(ctx)
+			switch hasErr := err != nil; {
+			case hasErr != test.wantErr:
+				t.Errorf("createTree() returned err = '%v', wantErr = %v", err, test.wantErr)
+				return
+			case hasErr:
+				return
+			}
+
+			if !proto.Equal(tree, test.wantTree) {
+				t.Errorf("post-createTree diff -got +want:\n%v", pretty.Compare(tree, test.wantTree))
+			}
+		})
 	}
 }
 
-// fakeAdminServer that implements CreateTree. If err is nil, the CreateTree
-// input is echoed as the output, otherwise err is returned instead.
-// The remaining methods are not implemented.
-type fakeAdminServer struct {
-	err error
-}
-
-// startFakeServer starts a fakeAdminServer on a random port.
-// Returns the started server, the listener it's using for connection and a
-// close function that must be defer-called on the scope the server is meant to
-// stop.
-func startFakeServer() (*fakeAdminServer, net.Listener, func(), error) {
-	grpcServer := grpc.NewServer()
-	fakeServer := &fakeAdminServer{}
-	trillian.RegisterTrillianAdminServer(grpcServer, fakeServer)
-
-	lis, err := net.Listen("tcp", "")
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	go grpcServer.Serve(lis)
-
-	stopFn := func() {
-		grpcServer.Stop()
-		lis.Close()
-	}
-	return fakeServer, lis, stopFn, nil
-}
-
-func (s *fakeAdminServer) CreateTree(ctx context.Context, req *trillian.CreateTreeRequest) (*trillian.Tree, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	resp := *req.Tree
-	return &resp, nil
-}
-
-var errUnimplemented = errors.New("unimplemented")
-
-func (s *fakeAdminServer) ListTrees(context.Context, *trillian.ListTreesRequest) (*trillian.ListTreesResponse, error) {
-	return nil, errUnimplemented
-}
-
-func (s *fakeAdminServer) GetTree(context.Context, *trillian.GetTreeRequest) (*trillian.Tree, error) {
-	return nil, errUnimplemented
-}
-
-func (s *fakeAdminServer) UpdateTree(context.Context, *trillian.UpdateTreeRequest) (*trillian.Tree, error) {
-	return nil, errUnimplemented
-}
-
-func (s *fakeAdminServer) DeleteTree(context.Context, *trillian.DeleteTreeRequest) (*empty.Empty, error) {
-	return nil, errUnimplemented
+// resetFlags sets all flags to their default values.
+func resetFlags() {
+	flag.Visit(func(f *flag.Flag) {
+		f.Value.Set(f.DefValue)
+	})
 }

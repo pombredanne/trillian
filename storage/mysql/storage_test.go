@@ -30,13 +30,17 @@ import (
 	"github.com/google/trillian/merkle"
 	"github.com/google/trillian/merkle/rfc6962"
 	"github.com/google/trillian/storage"
+	"github.com/google/trillian/storage/testdb"
+
 	storageto "github.com/google/trillian/storage/testonly"
 )
 
 func TestNodeRoundTrip(t *testing.T) {
+	ctx := context.Background()
+
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	const writeRevision = int64(100)
 	nodesToStore := createSomeNodes()
@@ -51,10 +55,10 @@ func TestNodeRoundTrip(t *testing.T) {
 		forceWriteRevision(writeRevision, tx)
 
 		// Need to read nodes before attempting to write
-		if _, err := tx.GetMerkleNodes(99, nodeIDsToRead); err != nil {
+		if _, err := tx.GetMerkleNodes(ctx, 99, nodeIDsToRead); err != nil {
 			t.Fatalf("Failed to read nodes: %s", err)
 		}
-		if err := tx.SetMerkleNodes(nodesToStore); err != nil {
+		if err := tx.SetMerkleNodes(ctx, nodesToStore); err != nil {
 			t.Fatalf("Failed to store nodes: %s", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -66,7 +70,7 @@ func TestNodeRoundTrip(t *testing.T) {
 		tx := beginLogTx(s, logID, t)
 		defer tx.Close()
 
-		readNodes, err := tx.GetMerkleNodes(100, nodeIDsToRead)
+		readNodes, err := tx.GetMerkleNodes(ctx, 100, nodeIDsToRead)
 		if err != nil {
 			t.Fatalf("Failed to retrieve nodes: %s", err)
 		}
@@ -80,9 +84,11 @@ func TestNodeRoundTrip(t *testing.T) {
 // This test ensures that node writes cross subtree boundaries so this edge case in the subtree
 // cache gets exercised. Any tree size > 256 will do this.
 func TestLogNodeRoundTripMultiSubtree(t *testing.T) {
+	ctx := context.Background()
+
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	const writeRevision = int64(100)
 	nodesToStore, err := createLogNodesForTreeAtSize(871, writeRevision)
@@ -100,10 +106,10 @@ func TestLogNodeRoundTripMultiSubtree(t *testing.T) {
 		forceWriteRevision(writeRevision, tx)
 
 		// Need to read nodes before attempting to write
-		if _, err := tx.GetMerkleNodes(writeRevision-1, nodeIDsToRead); err != nil {
+		if _, err := tx.GetMerkleNodes(ctx, writeRevision-1, nodeIDsToRead); err != nil {
 			t.Fatalf("Failed to read nodes: %s", err)
 		}
-		if err := tx.SetMerkleNodes(nodesToStore); err != nil {
+		if err := tx.SetMerkleNodes(ctx, nodesToStore); err != nil {
 			t.Fatalf("Failed to store nodes: %s", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -115,7 +121,7 @@ func TestLogNodeRoundTripMultiSubtree(t *testing.T) {
 		tx := beginLogTx(s, logID, t)
 		defer tx.Close()
 
-		readNodes, err := tx.GetMerkleNodes(100, nodeIDsToRead)
+		readNodes, err := tx.GetMerkleNodes(ctx, 100, nodeIDsToRead)
 		if err != nil {
 			t.Fatalf("Failed to retrieve nodes: %s", err)
 		}
@@ -153,13 +159,12 @@ func createSomeNodes() []storage.Node {
 }
 
 func createLogNodesForTreeAtSize(ts, rev int64) ([]storage.Node, error) {
-	tree := merkle.NewCompactMerkleTree(rfc6962.TreeHasher{Hash: crypto.SHA256})
+	tree := merkle.NewCompactMerkleTree(rfc6962.New(crypto.SHA256))
 	nodeMap := make(map[string]storage.Node)
 	for l := 0; l < int(ts); l++ {
 		// We're only interested in the side effects of adding leaves - the node updates
-		_, _, err := tree.AddLeaf([]byte(fmt.Sprintf("Leaf %d", l)), func(depth int, index int64, hash []byte) error {
+		if _, _, err := tree.AddLeaf([]byte(fmt.Sprintf("Leaf %d", l)), func(depth int, index int64, hash []byte) error {
 			nID, err := storage.NewNodeIDForTreeCoords(int64(depth), index, 64)
-
 			if err != nil {
 				return fmt.Errorf("failed to create a nodeID for tree - should not happen d:%d i:%d",
 					depth, index)
@@ -167,8 +172,7 @@ func createLogNodesForTreeAtSize(ts, rev int64) ([]storage.Node, error) {
 
 			nodeMap[nID.String()] = storage.Node{NodeID: nID, NodeRevision: rev, Hash: hash}
 			return nil
-		})
-		if err != nil {
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -219,7 +223,7 @@ func diffNodes(got, want []storage.Node) ([]storage.Node, []storage.Node) {
 }
 
 func openTestDBOrDie() *sql.DB {
-	db, err := OpenDB("test:zaphod@tcp(127.0.0.1:3306)/test")
+	db, err := testdb.NewTrillianDB(context.TODO())
 	if err != nil {
 		panic(err)
 	}
@@ -230,7 +234,7 @@ func openTestDBOrDie() *sql.DB {
 func cleanTestDB(db *sql.DB) {
 	for _, table := range allTables {
 		if _, err := db.ExecContext(context.TODO(), fmt.Sprintf("DELETE FROM %s", table)); err != nil {
-			panic(fmt.Errorf("Failed to delete rows in %s: %s", table, err))
+			panic(fmt.Sprintf("Failed to delete rows in %s: %s", table, err))
 		}
 	}
 }

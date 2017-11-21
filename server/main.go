@@ -15,22 +15,37 @@
 package server
 
 import (
-	"context"
 	"database/sql"
-	"expvar"
 	"net"
 	"net/http"
 	"time"
 
+	"github.com/coreos/etcd/clientv3"
 	"github.com/golang/glog"
 	"github.com/google/trillian"
 	"github.com/google/trillian/extension"
-	"github.com/google/trillian/monitoring/metric"
 	"github.com/google/trillian/server/admin"
 	"github.com/google/trillian/util"
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/naming"
 	"google.golang.org/grpc/reflection"
+
+	etcdnaming "github.com/coreos/etcd/clientv3/naming"
+)
+
+const (
+	// DefaultTreeDeleteThreshold is the suggested threshold for tree deletion.
+	// It represents the minimum time a tree has to remain Deleted before being hard-deleted.
+	DefaultTreeDeleteThreshold = 7 * 24 * time.Hour
+
+	// DefaultTreeDeleteMinInterval is the suggested min interval between tree GC sweeps.
+	// A tree GC sweep consists of listing deleted trees older than the deletion threshold and
+	// hard-deleting them.
+	// Actual runs happen randomly between [minInterval,2*minInterval).
+	DefaultTreeDeleteMinInterval = 4 * time.Hour
 )
 
 // Main encapsulates the data and logic to start a Trillian server (Log or Map).
@@ -41,11 +56,19 @@ type Main struct {
 	DB                        *sql.DB
 	Registry                  extension.Registry
 	Server                    *grpc.Server
+
 	// RegisterHandlerFn is called to register REST-proxy handlers.
 	RegisterHandlerFn func(context.Context, *runtime.ServeMux, string, []grpc.DialOption) error
 	// RegisterServerFn is called to register RPC servers.
-	RegisterServerFn    func(*grpc.Server, extension.Registry) error
-	DumpMetricsInterval time.Duration
+	RegisterServerFn func(*grpc.Server, extension.Registry) error
+
+	// AllowedTreeTypes determines which types of trees may be created through the Admin Server
+	// bound by Main. nil means unrestricted.
+	AllowedTreeTypes []trillian.TreeType
+
+	TreeGCEnabled         bool
+	TreeDeleteThreshold   time.Duration
+	TreeDeleteMinInterval time.Duration
 }
 
 // Run starts the configured server. Blocks until the server exits.
@@ -55,14 +78,10 @@ func (m *Main) Run(ctx context.Context) error {
 	defer m.Server.GracefulStop()
 	defer m.DB.Close()
 
-	if m.DumpMetricsInterval > 0 {
-		go metric.DumpToLog(ctx, m.DumpMetricsInterval)
-	}
-
 	if err := m.RegisterServerFn(m.Server, m.Registry); err != nil {
 		return err
 	}
-	trillian.RegisterTrillianAdminServer(m.Server, admin.New(m.Registry))
+	trillian.RegisterTrillianAdminServer(m.Server, admin.New(m.Registry, m.AllowedTreeTypes))
 	reflection.Register(m.Server)
 
 	if endpoint := m.HTTPEndpoint; endpoint != "" {
@@ -75,10 +94,11 @@ func (m *Main) Run(ctx context.Context) error {
 			return err
 		}
 		glog.Infof("HTTP server starting on %v", endpoint)
+
 		go http.ListenAndServe(endpoint, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			switch {
-			case req.RequestURI == "/debug/vars":
-				expvar.Handler().ServeHTTP(w, req)
+			case req.RequestURI == "/metrics":
+				promhttp.Handler().ServeHTTP(w, req)
 			default:
 				mux.ServeHTTP(w, req)
 			}
@@ -92,6 +112,18 @@ func (m *Main) Run(ctx context.Context) error {
 	}
 	go util.AwaitSignal(m.Server.Stop)
 
+	if m.TreeGCEnabled {
+		go func() {
+			glog.Info("Deleted tree GC started")
+			gc := admin.NewDeletedTreeGC(
+				m.Registry.AdminStorage,
+				m.TreeDeleteThreshold,
+				m.TreeDeleteMinInterval,
+				m.Registry.MetricFactory)
+			gc.Run(ctx)
+		}()
+	}
+
 	if err := m.Server.Serve(lis); err != nil {
 		glog.Errorf("RPC server terminated: %v", err)
 	}
@@ -103,4 +135,35 @@ func (m *Main) Run(ctx context.Context) error {
 	time.Sleep(time.Second * 5)
 
 	return nil
+}
+
+// AnnounceSelf announces this binary's presence to etcd.  Returns a function that
+// should be called on process exit.
+// AnnounceSelf does nothing if client is nil.
+func AnnounceSelf(ctx context.Context, client *clientv3.Client, etcdService, endpoint string) func() {
+	if client == nil {
+		return func() {}
+	}
+
+	res := etcdnaming.GRPCResolver{Client: client}
+
+	// Get a lease so our entry self-destructs.
+	leaseRsp, err := client.Grant(ctx, 30)
+	if err != nil {
+		glog.Exitf("Failed to get lease from etcd: %v", err)
+	}
+	client.KeepAlive(ctx, leaseRsp.ID)
+
+	update := naming.Update{Op: naming.Add, Addr: endpoint}
+	res.Update(ctx, etcdService, update, clientv3.WithLease(leaseRsp.ID))
+	glog.Infof("Announcing our presence in %v with %+v", etcdService, update)
+
+	bye := naming.Update{Op: naming.Delete, Addr: endpoint}
+	return func() {
+		// Use a background context because the original context may have been cancelled.
+		glog.Infof("Removing our presence in %v with %+v", etcdService, bye)
+		ctx := context.Background()
+		res.Update(ctx, etcdService, bye)
+		client.Revoke(ctx, leaseRsp.ID)
+	}
 }

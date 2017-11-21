@@ -16,18 +16,22 @@ syntax = "proto3";
 
 option java_multiple_files = true;
 option java_package = "com.google.trillian.proto";
-option java_outer_classname = "TrillianApiProto";
+option java_outer_classname = "TrillianMapApiProto";
+option go_package = "github.com/google/trillian";
 
 package trillian;
 
 import "trillian.proto";
+import "google/api/annotations.proto";
+import "google/protobuf/any.proto";
 
 // MapLeaf represents the data behind Map leaves.
 message MapLeaf {
   // index is the location of this leaf.
   // All indexes for a given Map must contain a constant number of bits.
   bytes index = 1;
-  // leaf_hash is the tree hash of leaf_value.
+  // leaf_hash is the tree hash of leaf_value.  This does not need to be set
+  // on SetMapLeavesRequest; the server will fill it in.
   bytes leaf_hash = 2;
   // leaf_value is the data the tree commits to.
   bytes leaf_value = 3;
@@ -43,6 +47,7 @@ message MapLeafInclusion {
 message GetMapLeavesRequest {
   int64 map_id = 1;
   repeated bytes index = 2;
+  // A negative revision indicates that the most recent published revision should be used.
   int64 revision = 3;
 }
 
@@ -54,7 +59,13 @@ message GetMapLeavesResponse {
 message SetMapLeavesRequest {
   int64 map_id = 1;
   repeated MapLeaf leaves = 2;
-  MapperMetadata mapper_data = 3;
+  reserved 3;  // was MapperMetadata (removed, replaced by metadata).
+  // Metadata that the Map should associate with the new Map root after
+  // incorporating the leaf changes.  The metadata will be reflected in the
+  // Map Root returned in the map's SetLeaves response.
+  // Map personalities should use metadata to persist any state needed later
+  // to continue mapping from an external data source.
+  google.protobuf.Any metadata = 4;
 }
 
 message SetMapLeavesResponse {
@@ -65,6 +76,11 @@ message GetSignedMapRootRequest {
   int64 map_id = 1;
 }
 
+message GetSignedMapRootByRevisionRequest {
+  int64 map_id = 1;
+  int64 revision = 2;
+}
+
 message GetSignedMapRootResponse {
   SignedMapRoot map_root = 2;
 }
@@ -72,7 +88,18 @@ message GetSignedMapRootResponse {
 // TrillianMap defines a service which provides access to a Verifiable Map as
 // defined in the Verifiable Data Structures paper.
 service TrillianMap {
+  // GetLeaves returns an inclusion proof for each index requested.
+  // For indexes that do not exist, the inclusion proof will use nil for the empty leaf value.
   rpc GetLeaves(GetMapLeavesRequest) returns(GetMapLeavesResponse) {}
   rpc SetLeaves(SetMapLeavesRequest) returns(SetMapLeavesResponse) {}
-  rpc GetSignedMapRoot(GetSignedMapRootRequest) returns(GetSignedMapRootResponse) {}
+  rpc GetSignedMapRoot(GetSignedMapRootRequest) returns(GetSignedMapRootResponse) {
+      option (google.api.http) = {
+        get: "/v1beta1/maps/{map_id}/roots:latest"
+      };
+  }
+  rpc GetSignedMapRootByRevision(GetSignedMapRootByRevisionRequest) returns(GetSignedMapRootResponse) {
+      option (google.api.http) = {
+        get: "/v1beta1/maps/{map_id}/roots/{revision}"
+      };
+  }
 }

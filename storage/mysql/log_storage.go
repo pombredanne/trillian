@@ -17,44 +17,38 @@ package mysql
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/trillian"
-	spb "github.com/google/trillian/crypto/sigpb"
-	"github.com/google/trillian/monitoring/metric"
+	"github.com/google/trillian/merkle/hashers"
+	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/cache"
 	"github.com/google/trillian/trees"
+	"github.com/mattn/go-sqlite3"
+
+	spb "github.com/google/trillian/crypto/sigpb"
 )
 
 const (
-	selectQueuedLeavesSQL = `SELECT LeafIdentityHash,MerkleLeafHash
-			FROM Unsequenced
-			WHERE TreeID=?
-			AND QueueTimestampNanos<=?
-			ORDER BY QueueTimestampNanos,LeafIdentityHash ASC LIMIT ?`
 	insertUnsequencedLeafSQL = `INSERT INTO LeafData(TreeId,LeafIdentityHash,LeafValue,ExtraData)
 			VALUES(?,?,?,?)`
-	insertUnsequencedEntrySQL = `INSERT INTO Unsequenced(TreeId,LeafIdentityHash,MerkleLeafHash,MessageId,QueueTimestampNanos)
-			VALUES(?,?,?,?,?)`
-	insertSequencedLeafSQL = `INSERT INTO SequencedLeafData(TreeId,LeafIdentityHash,MerkleLeafHash,SequenceNumber)
-			VALUES(?,?,?,?)`
-	selectSequencedLeafCountSQL  = "SELECT COUNT(*) FROM SequencedLeafData WHERE TreeId=?"
-	selectLatestSignedLogRootSQL = `SELECT TreeHeadTimestamp,TreeSize,RootHash,TreeRevision,RootSignature
+	selectSequencedLeafCountSQL   = "SELECT COUNT(*) FROM SequencedLeafData WHERE TreeId=?"
+	selectUnsequencedLeafCountSQL = "SELECT TreeId, COUNT(1) FROM Unsequenced GROUP BY TreeId"
+	selectLatestSignedLogRootSQL  = `SELECT TreeHeadTimestamp,TreeSize,RootHash,TreeRevision,RootSignature
 			FROM TreeHead WHERE TreeId=?
 			ORDER BY TreeHeadTimestamp DESC LIMIT 1`
 
 	// These statements need to be expanded to provide the correct number of parameter placeholders.
-	deleteUnsequencedSQL   = "DELETE FROM Unsequenced WHERE LeafIdentityHash IN (<placeholder>) AND TreeId = ?"
 	selectLeavesByIndexSQL = `SELECT s.MerkleLeafHash,l.LeafIdentityHash,l.LeafValue,s.SequenceNumber,l.ExtraData
 			FROM LeafData l,SequencedLeafData s
 			WHERE l.LeafIdentityHash = s.LeafIdentityHash
@@ -78,26 +72,68 @@ const (
 
 	// Error code returned by driver when inserting a duplicate row
 	errNumDuplicate = 1062
+
+	logIDLabel = "logid"
 )
 
 var (
 	defaultLogStrata = []int{8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8}
 
-	queuedCounter   = metric.NewCounter("mysql_queued_leaves")
-	dequeuedCounter = metric.NewCounter("mysql_dequeued_leaves")
+	once             sync.Once
+	queuedCounter    monitoring.Counter
+	queuedDupCounter monitoring.Counter
+	dequeuedCounter  monitoring.Counter
+
+	queueLatency            monitoring.Histogram
+	queueInsertLatency      monitoring.Histogram
+	queueReadLatency        monitoring.Histogram
+	queueInsertLeafLatency  monitoring.Histogram
+	queueInsertEntryLatency monitoring.Histogram
+	dequeueLatency          monitoring.Histogram
+	dequeueSelectLatency    monitoring.Histogram
+	dequeueRemoveLatency    monitoring.Histogram
 )
+
+func createMetrics(mf monitoring.MetricFactory) {
+	queuedCounter = mf.NewCounter("mysql_queued_leaves", "Number of leaves queued", logIDLabel)
+	queuedDupCounter = mf.NewCounter("mysql_queued_dup_leaves", "Number of duplicate leaves queued", logIDLabel)
+	dequeuedCounter = mf.NewCounter("mysql_dequeued_leaves", "Number of leaves dequeued", logIDLabel)
+
+	queueLatency = mf.NewHistogram("mysql_queue_leaves_latency", "Latency of queue leaves operation in seconds", logIDLabel)
+	queueInsertLatency = mf.NewHistogram("mysql_queue_leaves_latency_insert", "Latency of insertion part of queue leaves operation in seconds", logIDLabel)
+	queueReadLatency = mf.NewHistogram("mysql_queue_leaves_latency_read_dups", "Latency of read-duplicates part of queue leaves operation in seconds", logIDLabel)
+	queueInsertLeafLatency = mf.NewHistogram("mysql_queue_leaf_latency_leaf", "Latency of insert-leaf part of queue (single) leaf operation in seconds", logIDLabel)
+	queueInsertEntryLatency = mf.NewHistogram("mysql_queue_leaf_latency_entry", "Latency of insert-entry part of queue (single) leaf operation in seconds", logIDLabel)
+
+	dequeueLatency = mf.NewHistogram("mysql_dequeue_leaves_latency", "Latency of dequeue leaves operation in seconds", logIDLabel)
+	dequeueSelectLatency = mf.NewHistogram("mysql_dequeue_leaves_latency_select", "Latency of selection part of dequeue leaves operation in seconds", logIDLabel)
+	dequeueRemoveLatency = mf.NewHistogram("mysql_dequeue_leaves_latency_remove", "Latency of removal part of dequeue leaves operation in seconds", logIDLabel)
+}
+
+func labelForTX(t *logTreeTX) string {
+	return strconv.FormatInt(t.treeID, 10)
+}
+
+func observe(hist monitoring.Histogram, duration time.Duration, label string) {
+	hist.Observe(duration.Seconds(), label)
+}
 
 type mySQLLogStorage struct {
 	*mySQLTreeStorage
-	admin storage.AdminStorage
+	admin         storage.AdminStorage
+	metricFactory monitoring.MetricFactory
 }
 
 // NewLogStorage creates a storage.LogStorage instance for the specified MySQL URL.
 // It assumes storage.AdminStorage is backed by the same MySQL database as well.
-func NewLogStorage(db *sql.DB) storage.LogStorage {
+func NewLogStorage(db *sql.DB, mf monitoring.MetricFactory) storage.LogStorage {
+	if mf == nil {
+		mf = monitoring.InertMetricFactory{}
+	}
 	return &mySQLLogStorage{
 		admin:            NewAdminStorage(db),
 		mySQLTreeStorage: newTreeStorage(db),
+		metricFactory:    mf,
 	}
 }
 
@@ -105,55 +141,20 @@ func (m *mySQLLogStorage) CheckDatabaseAccessible(ctx context.Context) error {
 	return checkDatabaseAccessible(ctx, m.db)
 }
 
-func (m *mySQLLogStorage) getLeavesByIndexStmt(num int) (*sql.Stmt, error) {
-	return m.getStmt(selectLeavesByIndexSQL, num, "?", "?")
+func (m *mySQLLogStorage) getLeavesByIndexStmt(ctx context.Context, num int) (*sql.Stmt, error) {
+	return m.getStmt(ctx, selectLeavesByIndexSQL, num, "?", "?")
 }
 
-func (m *mySQLLogStorage) getLeavesByMerkleHashStmt(num int, orderBySequence bool) (*sql.Stmt, error) {
+func (m *mySQLLogStorage) getLeavesByMerkleHashStmt(ctx context.Context, num int, orderBySequence bool) (*sql.Stmt, error) {
 	if orderBySequence {
-		return m.getStmt(selectLeavesByMerkleHashOrderedBySequenceSQL, num, "?", "?")
+		return m.getStmt(ctx, selectLeavesByMerkleHashOrderedBySequenceSQL, num, "?", "?")
 	}
 
-	return m.getStmt(selectLeavesByMerkleHashSQL, num, "?", "?")
+	return m.getStmt(ctx, selectLeavesByMerkleHashSQL, num, "?", "?")
 }
 
-func (m *mySQLLogStorage) getLeavesByLeafIdentityHashStmt(num int) (*sql.Stmt, error) {
-	return m.getStmt(selectLeavesByLeafIdentityHashSQL, num, "?", "?")
-}
-
-func (m *mySQLLogStorage) getDeleteUnsequencedStmt(num int) (*sql.Stmt, error) {
-	return m.getStmt(deleteUnsequencedSQL, num, "?", "?")
-}
-
-func getActiveLogIDsInternal(ctx context.Context, tx *sql.Tx, sql string) ([]int64, error) {
-	rows, err := tx.QueryContext(ctx, sql)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	logIDs := make([]int64, 0)
-	for rows.Next() {
-		var treeID int64
-		if err := rows.Scan(&treeID); err != nil {
-			return nil, err
-		}
-		logIDs = append(logIDs, treeID)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return logIDs, nil
-}
-
-func getActiveLogIDs(ctx context.Context, tx *sql.Tx) ([]int64, error) {
-	return getActiveLogIDsInternal(ctx, tx, selectActiveLogsSQL)
-}
-
-func getActiveLogIDsWithPendingWork(ctx context.Context, tx *sql.Tx) ([]int64, error) {
-	return getActiveLogIDsInternal(ctx, tx, selectActiveLogsWithUnsequencedSQL)
+func (m *mySQLLogStorage) getLeavesByLeafIdentityHashStmt(ctx context.Context, num int) (*sql.Stmt, error) {
+	return m.getStmt(ctx, selectLeavesByLeafIdentityHashSQL, num, "?", "?")
 }
 
 // readOnlyLogTX implements storage.ReadOnlyLogTX
@@ -187,14 +188,27 @@ func (t *readOnlyLogTX) Close() error {
 }
 
 func (t *readOnlyLogTX) GetActiveLogIDs(ctx context.Context) ([]int64, error) {
-	return getActiveLogIDs(ctx, t.tx)
-}
-
-func (t *readOnlyLogTX) GetActiveLogIDsWithPendingWork(ctx context.Context) ([]int64, error) {
-	return getActiveLogIDsWithPendingWork(ctx, t.tx)
+	rows, err := t.tx.QueryContext(
+		ctx, selectNonDeletedTreeIDByTypeAndStateSQL, trillian.TreeType_LOG.String(), trillian.TreeState_ACTIVE.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []int64{}
+	for rows.Next() {
+		var treeID int64
+		if err := rows.Scan(&treeID); err != nil {
+			return nil, err
+		}
+		ids = append(ids, treeID)
+	}
+	return ids, rows.Err()
 }
 
 func (m *mySQLLogStorage) beginInternal(ctx context.Context, treeID int64, readonly bool) (storage.LogTreeTX, error) {
+	once.Do(func() {
+		createMetrics(m.metricFactory)
+	})
 	tree, err := trees.GetTree(
 		ctx,
 		m.admin,
@@ -203,12 +217,13 @@ func (m *mySQLLogStorage) beginInternal(ctx context.Context, treeID int64, reado
 	if err != nil {
 		return nil, err
 	}
-	hasher, err := trees.Hasher(tree)
+	hasher, err := hashers.NewLogHasher(tree.HashStrategy)
 	if err != nil {
 		return nil, err
 	}
 
-	ttx, err := m.beginTreeTx(ctx, treeID, hasher.Size(), defaultLogStrata, cache.PopulateLogSubtreeNodes(hasher), cache.PrepareLogSubtreeWrite())
+	stCache := cache.NewLogSubtreeCache(defaultLogStrata, hasher)
+	ttx, err := m.beginTreeTx(ctx, treeID, hasher.Size(), stCache)
 	if err != nil {
 		return nil, err
 	}
@@ -255,6 +270,7 @@ func (t *logTreeTX) WriteRevision() int64 {
 }
 
 func (t *logTreeTX) DequeueLeaves(ctx context.Context, limit int, cutoffTime time.Time) ([]*trillian.LogLeaf, error) {
+	start := time.Now()
 	stx, err := t.tx.PrepareContext(ctx, selectQueuedLeavesSQL)
 
 	if err != nil {
@@ -263,6 +279,7 @@ func (t *logTreeTX) DequeueLeaves(ctx context.Context, limit int, cutoffTime tim
 	}
 
 	leaves := make([]*trillian.LogLeaf, 0, limit)
+	dq := make([]dequeuedLeaf, 0, limit)
 	rows, err := stx.QueryContext(ctx, t.treeID, cutoffTime.UnixNano(), limit)
 
 	if err != nil {
@@ -275,16 +292,12 @@ func (t *logTreeTX) DequeueLeaves(ctx context.Context, limit int, cutoffTime tim
 	for rows.Next() {
 		var leafIDHash []byte
 		var merkleHash []byte
+		var meta dequeueMeta
 
-		err := rows.Scan(&leafIDHash, &merkleHash)
-
+		err := rows.Scan(&leafIDHash, &merkleHash, &meta)
 		if err != nil {
 			glog.Warningf("Error scanning work rows: %s", err)
 			return nil, err
-		}
-
-		if len(leafIDHash) != t.hashSizeBytes {
-			return nil, errors.New("Dequeued a leaf with incorrect hash size")
 		}
 
 		// Note: the LeafData and ExtraData being nil here is OK as this is only used by the
@@ -294,24 +307,37 @@ func (t *logTreeTX) DequeueLeaves(ctx context.Context, limit int, cutoffTime tim
 			LeafIdentityHash: leafIDHash,
 			MerkleLeafHash:   merkleHash,
 		}
+
+		if len(leaf.LeafIdentityHash) != t.hashSizeBytes {
+			return nil, errors.New("dequeued a leaf with incorrect hash size")
+		}
+
 		leaves = append(leaves, leaf)
+		dq = append(dq, dequeueInfo(leafIDHash, meta))
 	}
 
 	if rows.Err() != nil {
 		return nil, rows.Err()
 	}
+	label := labelForTX(t)
+	selectDuration := time.Since(start)
+	observe(dequeueSelectLatency, selectDuration, label)
 
 	// The convention is that if leaf processing succeeds (by committing this tx)
 	// then the unsequenced entries for them are removed
 	if len(leaves) > 0 {
-		err = t.removeSequencedLeaves(ctx, leaves)
+		err = t.removeSequencedLeaves(ctx, dq)
 	}
 
 	if err != nil {
 		return nil, err
 	}
 
-	dequeuedCounter.Add(int64(len(leaves)))
+	totalDuration := time.Since(start)
+	removeDuration := totalDuration - selectDuration
+	observe(dequeueRemoveLatency, removeDuration, label)
+	observe(dequeueLatency, totalDuration, label)
+	dequeuedCounter.Add(float64(len(leaves)), label)
 
 	return leaves, nil
 }
@@ -323,8 +349,12 @@ func (t *logTreeTX) QueueLeaves(ctx context.Context, leaves []*trillian.LogLeaf,
 			return nil, fmt.Errorf("queued leaf must have a leaf ID hash of length %d", t.hashSizeBytes)
 		}
 	}
+	start := time.Now()
+	label := labelForTX(t)
 
 	// Insert in order of the hash values in the leaves, but track original position for return value.
+	// This is to make the order that row locks are acquired deterministic and helps to reduce
+	// the chance of deadlocks.
 	orderedLeaves := make([]leafAndPosition, len(leaves))
 	for i, leaf := range leaves {
 		orderedLeaves[i] = leafAndPosition{leaf: leaf, idx: i}
@@ -334,12 +364,16 @@ func (t *logTreeTX) QueueLeaves(ctx context.Context, leaves []*trillian.LogLeaf,
 	existingLeaves := make([]*trillian.LogLeaf, len(leaves))
 
 	for i, leafPos := range orderedLeaves {
+		leafStart := time.Now()
 		leaf := leafPos.leaf
 		_, err := t.tx.ExecContext(ctx, insertUnsequencedLeafSQL, t.treeID, leaf.LeafIdentityHash, leaf.LeafValue, leaf.ExtraData)
+		insertDuration := time.Since(leafStart)
+		observe(queueInsertLeafLatency, insertDuration, label)
 		if isDuplicateErr(err) {
 			// Remember the duplicate leaf, using the requested leaf for now.
 			existingLeaves[leafPos.idx] = leaf
 			existingCount++
+			queuedDupCounter.Inc(label)
 			continue
 		}
 		if err != nil {
@@ -348,27 +382,27 @@ func (t *logTreeTX) QueueLeaves(ctx context.Context, leaves []*trillian.LogLeaf,
 		}
 
 		// Create the work queue entry
-		// Message ids only need to guard against duplicates for the time that entries are
-		// in the unsequenced queue, which should be short, but we'll still use a strong hash.
-		// TODO(alcutter): get this from somewhere else
-		hasher := sha256.New()
-		binary.Write(hasher, binary.LittleEndian, t.treeID)
-		hasher.Write(leaf.LeafIdentityHash)
-		messageID := hasher.Sum(nil)
-
-		_, err = t.tx.ExecContext(
-			ctx,
-			insertUnsequencedEntrySQL,
+		args := []interface{}{
 			t.treeID,
 			leaf.LeafIdentityHash,
 			leaf.MerkleLeafHash,
-			messageID,
-			queueTimestamp.UnixNano())
+		}
+		args = append(args, queueArgs(t.treeID, leaf.LeafIdentityHash, queueTimestamp)...)
+		_, err = t.tx.ExecContext(
+			ctx,
+			insertUnsequencedEntrySQL,
+			args...,
+		)
 		if err != nil {
 			glog.Warningf("Error inserting into Unsequenced: %s", err)
 			return nil, fmt.Errorf("Unsequenced: %v", err)
 		}
+		leafDuration := time.Since(leafStart)
+		observe(queueInsertEntryLatency, (leafDuration - insertDuration), label)
 	}
+	insertDuration := time.Since(start)
+	observe(queueInsertLatency, insertDuration, label)
+	queuedCounter.Add(float64(len(leaves)), label)
 
 	if existingCount == 0 {
 		return existingLeaves, nil
@@ -395,7 +429,7 @@ func (t *logTreeTX) QueueLeaves(ctx context.Context, leaves []*trillian.LogLeaf,
 		}
 		found := false
 		for _, result := range results {
-			if bytes.Compare(result.LeafIdentityHash, requested.LeafIdentityHash) == 0 {
+			if bytes.Equal(result.LeafIdentityHash, requested.LeafIdentityHash) {
 				existingLeaves[i] = result
 				found = true
 				break
@@ -405,8 +439,10 @@ func (t *logTreeTX) QueueLeaves(ctx context.Context, leaves []*trillian.LogLeaf,
 			return nil, fmt.Errorf("failed to find existing leaf for hash %x", requested.LeafIdentityHash)
 		}
 	}
-
-	queuedCounter.Add(int64(len(leaves)))
+	totalDuration := time.Since(start)
+	readDuration := totalDuration - insertDuration
+	observe(queueReadLatency, readDuration, label)
+	observe(queueLatency, totalDuration, label)
 
 	return existingLeaves, nil
 }
@@ -424,7 +460,7 @@ func (t *logTreeTX) GetSequencedLeafCount(ctx context.Context) (int64, error) {
 }
 
 func (t *logTreeTX) GetLeavesByIndex(ctx context.Context, leaves []int64) ([]*trillian.LogLeaf, error) {
-	tmpl, err := t.ls.getLeavesByIndexStmt(len(leaves))
+	tmpl, err := t.ls.getLeavesByIndexStmt(ctx, len(leaves))
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +499,7 @@ func (t *logTreeTX) GetLeavesByIndex(ctx context.Context, leaves []int64) ([]*tr
 }
 
 func (t *logTreeTX) GetLeavesByHash(ctx context.Context, leafHashes [][]byte, orderBySequence bool) ([]*trillian.LogLeaf, error) {
-	tmpl, err := t.ls.getLeavesByMerkleHashStmt(len(leafHashes), orderBySequence)
+	tmpl, err := t.ls.getLeavesByMerkleHashStmt(ctx, len(leafHashes), orderBySequence)
 	if err != nil {
 		return nil, err
 	}
@@ -475,7 +511,7 @@ func (t *logTreeTX) GetLeavesByHash(ctx context.Context, leafHashes [][]byte, or
 // as a slice of LogLeaf objects for convenience.  However, note that the
 // returned LogLeaf objects will not have a valid MerkleLeafHash or LeafIndex.
 func (t *logTreeTX) getLeafDataByIdentityHash(ctx context.Context, leafHashes [][]byte) ([]*trillian.LogLeaf, error) {
-	tmpl, err := t.ls.getLeavesByLeafIdentityHashStmt(len(leafHashes))
+	tmpl, err := t.ls.getLeavesByLeafIdentityHashStmt(ctx, len(leafHashes))
 	if err != nil {
 		return nil, err
 	}
@@ -542,66 +578,10 @@ func (t *logTreeTX) StoreSignedLogRoot(ctx context.Context, root trillian.Signed
 	return checkResultOkAndRowCountIs(res, err, 1)
 }
 
-func (t *logTreeTX) UpdateSequencedLeaves(ctx context.Context, leaves []*trillian.LogLeaf) error {
-	// TODO: In theory we can do this with CASE / WHEN in one SQL statement but it's more fiddly
-	// and can be implemented later if necessary
-	for _, leaf := range leaves {
-		// This should fail on insert but catch it early
-		if len(leaf.LeafIdentityHash) != t.hashSizeBytes {
-			return errors.New("Sequenced leaf has incorrect hash size")
-		}
-
-		_, err := t.tx.ExecContext(
-			ctx,
-			insertSequencedLeafSQL,
-			t.treeID,
-			leaf.LeafIdentityHash,
-			leaf.MerkleLeafHash,
-			leaf.LeafIndex)
-		if err != nil {
-			glog.Warningf("Failed to update sequenced leaves: %s", err)
-			return err
-		}
-	}
-
-	return nil
-}
-
-// removeSequencedLeaves removes the passed in leaves slice (which may be
-// modified as part of the operation).
-func (t *logTreeTX) removeSequencedLeaves(ctx context.Context, leaves []*trillian.LogLeaf) error {
-	// Delete in order of the hash values in the leaves.
-	sort.Sort(byLeafIdentityHash(leaves))
-
-	tmpl, err := t.ls.getDeleteUnsequencedStmt(len(leaves))
-	if err != nil {
-		glog.Warningf("Failed to get delete statement for sequenced work: %s", err)
-		return err
-	}
-	stx := t.tx.StmtContext(ctx, tmpl)
-	var args []interface{}
-	for _, leaf := range leaves {
-		args = append(args, interface{}(leaf.LeafIdentityHash))
-	}
-	args = append(args, interface{}(t.treeID))
-	result, err := stx.ExecContext(ctx, args...)
-
-	if err != nil {
-		// Error is handled by checkResultOkAndRowCountIs() below
-		glog.Warningf("Failed to delete sequenced work: %s", err)
-	}
-
-	err = checkResultOkAndRowCountIs(result, err, int64(len(leaves)))
-
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func (t *logTreeTX) getLeavesByHashInternal(ctx context.Context, leafHashes [][]byte, tmpl *sql.Stmt, desc string) ([]*trillian.LogLeaf, error) {
 	stx := t.tx.StmtContext(ctx, tmpl)
+	defer stx.Close()
+
 	var args []interface{}
 	for _, hash := range leafHashes {
 		args = append(args, interface{}([]byte(hash)))
@@ -612,11 +592,10 @@ func (t *logTreeTX) getLeavesByHashInternal(ctx context.Context, leafHashes [][]
 		glog.Warningf("Query() %s hash = %v", desc, err)
 		return nil, err
 	}
+	defer rows.Close()
 
 	// The tree could include duplicates so we don't know how many results will be returned
 	var ret []*trillian.LogLeaf
-
-	defer rows.Close()
 	for rows.Next() {
 		leaf := &trillian.LogLeaf{}
 
@@ -635,29 +614,25 @@ func (t *logTreeTX) getLeavesByHashInternal(ctx context.Context, leafHashes [][]
 	return ret, nil
 }
 
-// GetActiveLogIDs returns a list of the IDs of all configured logs
-func (t *logTreeTX) GetActiveLogIDs(ctx context.Context) ([]int64, error) {
-	return getActiveLogIDs(ctx, t.tx)
-}
-
-// GetActiveLogIDsWithPendingWork returns a list of the IDs of all configured logs
-// that have queued unsequenced leaves that need to be integrated
-func (t *logTreeTX) GetActiveLogIDsWithPendingWork(ctx context.Context) ([]int64, error) {
-	return getActiveLogIDsWithPendingWork(ctx, t.tx)
-}
-
-// byLeafIdentityHash allows sorting of leaves by their identity hash, so DB
-// operations always happen in a consistent order.
-type byLeafIdentityHash []*trillian.LogLeaf
-
-func (l byLeafIdentityHash) Len() int {
-	return len(l)
-}
-func (l byLeafIdentityHash) Swap(i, j int) {
-	l[i], l[j] = l[j], l[i]
-}
-func (l byLeafIdentityHash) Less(i, j int) bool {
-	return bytes.Compare(l[i].LeafIdentityHash, l[j].LeafIdentityHash) == -1
+func (t *readOnlyLogTX) GetUnsequencedCounts(ctx context.Context) (storage.CountByLogID, error) {
+	stx, err := t.tx.PrepareContext(ctx, selectUnsequencedLeafCountSQL)
+	if err != nil {
+		glog.Warningf("Failed to prep unsequenced leaf count statement: %v", err)
+		return nil, err
+	}
+	rows, err := stx.QueryContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ret := make(map[int64]int64)
+	for rows.Next() {
+		var logID, count int64
+		if err := rows.Scan(&logID, &count); err != nil {
+			return nil, fmt.Errorf("failed to scan row from unsequenced counts: %v", err)
+		}
+		ret[logID] = count
+	}
+	return ret, nil
 }
 
 // leafAndPosition records original position before sort.
@@ -681,11 +656,12 @@ func (l byLeafIdentityHashWithPosition) Less(i, j int) bool {
 }
 
 func isDuplicateErr(err error) bool {
-	if err != nil {
-		if mysqlErr, ok := err.(*mysql.MySQLError); ok && mysqlErr.Number == errNumDuplicate {
-			return true
-		}
+	switch err := err.(type) {
+	case *mysql.MySQLError:
+		return err.Number == errNumDuplicate
+	case sqlite3.Error:
+		return err.Code == sqlite3.ErrConstraint && err.ExtendedCode == sqlite3.ErrConstraintPrimaryKey
+	default:
+		return false
 	}
-
-	return false
 }

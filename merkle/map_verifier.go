@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/google/trillian/merkle/hashers"
 	"github.com/google/trillian/storage"
 )
 
@@ -28,43 +29,66 @@ import (
 // append-only logs, but adds support for nil/"default" proof nodes.
 //
 // Returns nil on a successful verification, and an error otherwise.
-func VerifyMapInclusionProof(index, leafHash, expectedRoot []byte, proof [][]byte, h MapHasher) error {
-	hBits := h.Size() * 8
+func VerifyMapInclusionProof(treeID int64, index, leaf, expectedRoot []byte, proof [][]byte, h hashers.MapHasher) error {
+	if got, want := len(index)*8, h.BitLen(); got != want {
+		return fmt.Errorf("index len: %d, want %d", got, want)
+	}
+	if got, want := len(proof), h.BitLen(); got != want {
+		return fmt.Errorf("proof len: %d, want %d", got, want)
+	}
+	for i, element := range proof {
+		if got, wanta, wantb := len(element), 0, h.Size(); got != wanta && got != wantb {
+			return fmt.Errorf("proof[%d] len: %d, want %d or %d", i, got, wanta, wantb)
+		}
+	}
 
-	if got, want := len(proof), hBits; got != want {
-		return fmt.Errorf("invalid proof length %d, expected %d", got, want)
-	}
-	if got, want := len(index)*8, hBits; got != want {
-		return fmt.Errorf("invalid index length %d, expected %d", got, want)
-	}
-	if got, want := len(leafHash)*8, hBits; got != want {
-		return fmt.Errorf("invalid leafHash length %d, expected %d", got, want)
+	var runningHash []byte
+	if len(leaf) != 0 {
+		leafHash, err := h.HashLeaf(treeID, index, leaf)
+		if err != nil {
+			return fmt.Errorf("HashLeaf(): %v", err)
+		}
+		runningHash = leafHash
 	}
 
-	// TODO(al): Remove this dep on storage, since clients will want to use this code.
 	nID := storage.NewNodeIDFromHash(index)
+	for height, sib := range nID.Siblings() {
+		pElement := proof[height]
 
-	runningHash := make([]byte, len(leafHash))
-	copy(runningHash, leafHash)
+		// Since empty values are tied to a location and a level,
+		// HashEmpty(leve1) != HashChildren(E0, E0).
+		// Therefore we need to maintain an empty marker along the
+		// proof path until the first non-empty element so we can call
+		// HashEmpty once at the top of the empty branch.
+		if len(runningHash) == 0 && len(pElement) == 0 {
+			continue
+		}
+		// When we reach a level that has a neighbor, we compute the empty value
+		// for the branch that we are on before combining it with the neighbor.
+		if len(runningHash) == 0 && len(pElement) != 0 {
+			depth := nID.PrefixLenBits - height
+			emptyBranch := nID.Copy().MaskLeft(depth)
+			runningHash = h.HashEmpty(treeID, emptyBranch.Path, height)
+		}
 
-	for bit := 0; bit < hBits; bit++ {
-		proofIsRightHandElement := nID.Bit(bit) == 0
-		pElement := proof[bit]
-		if len(pElement) == 0 {
-			pElement = h.nullHashes[hBits-1-bit]
+		if len(runningHash) != 0 && len(pElement) == 0 {
+			pElement = h.HashEmpty(treeID, sib.Path, height)
 		}
-		if got, want := len(pElement)*8, hBits; got != want {
-			return fmt.Errorf("invalid proof: element has length %d, expected %d", got, want)
-		}
+		proofIsRightHandElement := nID.Bit(height) == 0
 		if proofIsRightHandElement {
 			runningHash = h.HashChildren(runningHash, pElement)
 		} else {
 			runningHash = h.HashChildren(pElement, runningHash)
 		}
 	}
+	if len(runningHash) == 0 {
+		depth := 0
+		emptyBranch := nID.Copy().MaskLeft(depth)
+		runningHash = h.HashEmpty(treeID, emptyBranch.Path, h.BitLen())
+	}
 
 	if got, want := runningHash, expectedRoot; !bytes.Equal(got, want) {
-		return fmt.Errorf("invalid proof; calculated roothash %v but expected %v", got, want)
+		return fmt.Errorf("calculated root: %x, want \n%x", got, want)
 	}
 	return nil
 }

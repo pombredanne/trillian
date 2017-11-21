@@ -32,6 +32,8 @@ package merkle
 import (
 	"errors"
 	"fmt"
+
+	"github.com/google/trillian/merkle/hashers"
 )
 
 // TreeEntry is used for nodes in the tree for better readability. Just holds a hash but could be extended
@@ -99,7 +101,7 @@ type InMemoryMerkleTree struct {
 	tree            [][]TreeEntry
 	leavesProcessed int64
 	levelCount      int64
-	hasher          TreeHasher
+	hasher          hashers.LogHasher
 }
 
 // isPowerOfTwoPlusOne tests whether a number is (2^x)-1 for some x. From MerkleTreeMath in C++
@@ -125,7 +127,7 @@ func sibling(leaf int64) int64 {
 }
 
 // NewInMemoryMerkleTree creates a new empty Merkle Tree using the specified Hasher
-func NewInMemoryMerkleTree(hasher TreeHasher) *InMemoryMerkleTree {
+func NewInMemoryMerkleTree(hasher hashers.LogHasher) *InMemoryMerkleTree {
 	mt := InMemoryMerkleTree{}
 
 	mt.hasher = hasher
@@ -226,8 +228,13 @@ func (mt *InMemoryMerkleTree) popBack(level int64) {
 //
 // Returns the position of the leaf in the tree. Indexing starts at 1,
 // so position = number of leaves in the tree after this update.
-func (mt *InMemoryMerkleTree) AddLeaf(leafData []byte) (int64, TreeEntry) {
-	return mt.addLeafHash(mt.hasher.HashLeaf(leafData))
+func (mt *InMemoryMerkleTree) AddLeaf(leafData []byte) (int64, TreeEntry, error) {
+	leafHash, err := mt.hasher.HashLeaf(leafData)
+	if err != nil {
+		return 0, TreeEntry{}, err
+	}
+	leafCount, treeEntry := mt.addLeafHash(leafHash)
+	return leafCount, treeEntry, nil
 }
 
 func (mt *InMemoryMerkleTree) addLeafHash(leafData []byte) (int64, TreeEntry) {
@@ -270,7 +277,7 @@ func (mt *InMemoryMerkleTree) CurrentRoot() TreeEntry {
 // (i.e., the tree is not large enough).
 func (mt *InMemoryMerkleTree) RootAtSnapshot(snapshot int64) TreeEntry {
 	if snapshot == 0 {
-		return TreeEntry{mt.hasher.HashEmpty()}
+		return TreeEntry{mt.hasher.EmptyRoot()}
 	}
 
 	// Snapshot index bigger than tree, this is not the TreeEntry you're looking for
@@ -289,7 +296,7 @@ func (mt *InMemoryMerkleTree) RootAtSnapshot(snapshot int64) TreeEntry {
 // updateToSnapshot updates the tree to a given snapshot (if necessary), returns the root.
 func (mt *InMemoryMerkleTree) updateToSnapshot(snapshot int64) TreeEntry {
 	if snapshot == 0 {
-		return TreeEntry{mt.hasher.HashEmpty()}
+		return TreeEntry{mt.hasher.EmptyRoot()}
 	}
 
 	if snapshot == 1 {

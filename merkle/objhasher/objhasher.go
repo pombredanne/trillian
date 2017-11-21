@@ -12,45 +12,59 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package objhasher provides generic object hashing functionality.
 package objhasher
 
 import (
-	"crypto/sha256" // Use SHA256 to match ObjectHash.
+	"crypto"
+	"fmt"
 
 	"github.com/benlaurie/objecthash/go/objecthash"
+	"github.com/google/trillian"
+	"github.com/google/trillian/merkle/hashers"
+	"github.com/google/trillian/merkle/rfc6962"
 )
 
-// ObjectHasher uses ObjectHash to compute leaf hashes.
-var ObjectHasher = &objhasher{}
+func init() {
+	hashers.RegisterLogHasher(trillian.HashStrategy_OBJECT_RFC6962_SHA256, NewLogHasher(rfc6962.New(crypto.SHA256)))
+}
 
-// ObjectHash does not use `1` as any of its type prefixes,
-// preserving domain separation.
-const nodeHashPrefix = 1
+type objmaphasher struct {
+	hashers.MapHasher
+}
 
-type objhasher struct{}
+type objloghasher struct {
+	hashers.LogHasher
+}
 
-// HashEmpty returns the hash of an empty element for the tree
-func (o *objhasher) HashEmpty() []byte {
-	return sha256.New().Sum(nil)
+// NewMapHasher returns a new ObjectHasher based on the passed in MapHasher
+func NewMapHasher(baseHasher hashers.MapHasher) hashers.MapHasher {
+	return &objmaphasher{
+		MapHasher: baseHasher,
+	}
+}
+
+// NewLogHasher returns a new ObjectHasher based on the passed in MapHasher
+func NewLogHasher(baseHasher hashers.LogHasher) hashers.LogHasher {
+	return &objloghasher{
+		LogHasher: baseHasher,
+	}
 }
 
 // HashLeaf returns the object hash of leaf, which must be a JSON object.
-func (o *objhasher) HashLeaf(leaf []byte) []byte {
-	hash := objecthash.CommonJSONHash(string(leaf))
-	return hash[:]
+func (o *objloghasher) HashLeaf(leaf []byte) ([]byte, error) {
+	hash, err := objecthash.CommonJSONHash(string(leaf))
+	if err != nil {
+		return nil, fmt.Errorf("CommonJSONHash(%s): %v", leaf, err)
+	}
+	return hash[:], err
 }
 
-// HashChildren returns the inner Merkle tree node hash of the the two child nodes l and r.
-// The hashed structure is NodeHashPrefix||l||r.
-func (o *objhasher) HashChildren(l, r []byte) []byte {
-	h := sha256.New()
-	h.Write([]byte{nodeHashPrefix})
-	h.Write(l)
-	h.Write(r)
-	return h.Sum(nil)
-}
-
-// Size returns the number of bytes in the hash output.
-func (o *objhasher) Size() int {
-	return sha256.Size
+// HashLeaf returns the object hash of leaf, which must be a JSON object.
+func (o *objmaphasher) HashLeaf(treeID int64, index []byte, leaf []byte) ([]byte, error) {
+	hash, err := objecthash.CommonJSONHash(string(leaf))
+	if err != nil {
+		return nil, fmt.Errorf("CommonJSONHash(%s): %v", leaf, err)
+	}
+	return hash[:], nil
 }

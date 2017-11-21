@@ -16,10 +16,7 @@
 // command.
 //
 // Example usage:
-// $ ./createtree \
-//     --admin_server=host:port \
-//     --pem_key_path=/path/to/pem/file \
-//     --pem_key_password=mypassword
+// $ ./createtree --admin_server=host:port
 //
 // The command outputs the tree ID of the created tree to stdout, or an error to
 // stderr in case of failure. The output is minimal to allow for easy usage in
@@ -36,149 +33,144 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os"
+	"time"
 
+	"github.com/golang/glog"
 	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/any"
 	"github.com/google/trillian"
+	"github.com/google/trillian/cmd"
+	"github.com/google/trillian/cmd/createtree/keys"
+	"github.com/google/trillian/crypto/keyspb"
 	"github.com/google/trillian/crypto/sigpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
 	adminServerAddr = flag.String("admin_server", "", "Address of the gRPC Trillian Admin Server (host:port)")
+	rpcDeadline     = flag.Duration("rpc_deadline", time.Second*10, "Deadline for RPC requests")
 
 	treeState          = flag.String("tree_state", trillian.TreeState_ACTIVE.String(), "State of the new tree")
 	treeType           = flag.String("tree_type", trillian.TreeType_LOG.String(), "Type of the new tree")
-	hashStrategy       = flag.String("hash_strategy", trillian.HashStrategy_RFC_6962.String(), "Hash strategy (aka preimage protection) of the new tree")
+	hashStrategy       = flag.String("hash_strategy", trillian.HashStrategy_RFC6962_SHA256.String(), "Hash strategy (aka preimage protection) of the new tree")
 	hashAlgorithm      = flag.String("hash_algorithm", sigpb.DigitallySigned_SHA256.String(), "Hash algorithm of the new tree")
-	signatureAlgorithm = flag.String("signature_algorithm", sigpb.DigitallySigned_RSA.String(), "Signature algorithm of the new tree")
+	signatureAlgorithm = flag.String("signature_algorithm", sigpb.DigitallySigned_ECDSA.String(), "Signature algorithm of the new tree")
 	displayName        = flag.String("display_name", "", "Display name of the new tree")
 	description        = flag.String("description", "", "Description of the new tree")
+	maxRootDuration    = flag.Duration("max_root_duration", 0, "Interval after which a new signed root is produced despite no submissions; zero means never")
+	privateKeyFormat   = flag.String("private_key_format", "", "Type of protobuf message to send the key as (PrivateKey, PEMKeyFile, or PKCS11ConfigFile). If empty, a key will be generated for you by Trillian.")
 
-	privateKeyFormat = flag.String("private_key_format", "PEMKeyFile", "Type of private key to be used")
-	pemKeyPath       = flag.String("pem_key_path", "", "Path to the private key PEM file")
-	pemKeyPassword   = flag.String("pem_key_password", "", "Password of the private key PEM file")
+	configFile = flag.String("config", "", "Config file containing flags, file contents can be overridden by command line flags")
 )
 
-// createOpts contains all user-supplied options required to run the program.
-// It's meant to facilitate tests and focus flag reads to a single point.
-type createOpts struct {
-	addr                                                                                     string
-	treeState, treeType, hashStrategy, hashAlgorithm, sigAlgorithm, displayName, description string
-	privateKeyType, pemKeyPath, pemKeyPass                                                   string
-}
-
-func createTree(ctx context.Context, opts *createOpts) (*trillian.Tree, error) {
-	if opts.addr == "" {
+func createTree(ctx context.Context) (*trillian.Tree, error) {
+	if *adminServerAddr == "" {
 		return nil, errors.New("empty --admin_server, please provide the Admin server host:port")
 	}
 
-	req, err := newRequest(opts)
+	req, err := newRequest()
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := grpc.Dial(opts.addr, grpc.WithInsecure())
+	conn, err := grpc.Dial(*adminServerAddr, grpc.WithInsecure())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to dial %v: %v", *adminServerAddr, err)
 	}
 	defer conn.Close()
 
-	tree, err := trillian.NewTrillianAdminClient(conn).CreateTree(ctx, req)
-	if err != nil {
-		return nil, err
+	client := trillian.NewTrillianAdminClient(conn)
+	for {
+		tree, err := client.CreateTree(ctx, req)
+		if err == nil {
+			return tree, nil
+		}
+		if s, ok := status.FromError(err); ok && s.Code() == codes.Unavailable {
+			glog.Errorf("Admin server unavailable, trying again: %v", err)
+			continue
+		}
+		return nil, fmt.Errorf("failed to CreateTree(%+v): %T %v", req, err, err)
 	}
-	return tree, nil
 }
 
-func newRequest(opts *createOpts) (*trillian.CreateTreeRequest, error) {
-	ts, ok := trillian.TreeState_value[opts.treeState]
+func newRequest() (*trillian.CreateTreeRequest, error) {
+	ts, ok := trillian.TreeState_value[*treeState]
 	if !ok {
-		return nil, fmt.Errorf("unknown TreeState: %v", opts.treeState)
+		return nil, fmt.Errorf("unknown TreeState: %v", *treeState)
 	}
 
-	tt, ok := trillian.TreeType_value[opts.treeType]
+	tt, ok := trillian.TreeType_value[*treeType]
 	if !ok {
-		return nil, fmt.Errorf("unknown TreeType: %v", opts.treeType)
+		return nil, fmt.Errorf("unknown TreeType: %v", *treeType)
 	}
 
-	hs, ok := trillian.HashStrategy_value[opts.hashStrategy]
+	hs, ok := trillian.HashStrategy_value[*hashStrategy]
 	if !ok {
-		return nil, fmt.Errorf("unknown HashStrategy: %v", opts.hashStrategy)
+		return nil, fmt.Errorf("unknown HashStrategy: %v", *hashStrategy)
 	}
 
-	ha, ok := sigpb.DigitallySigned_HashAlgorithm_value[opts.hashAlgorithm]
+	ha, ok := sigpb.DigitallySigned_HashAlgorithm_value[*hashAlgorithm]
 	if !ok {
-		return nil, fmt.Errorf("unknown HashAlgorithm: %v", opts.hashAlgorithm)
+		return nil, fmt.Errorf("unknown HashAlgorithm: %v", *hashAlgorithm)
 	}
 
-	sa, ok := sigpb.DigitallySigned_SignatureAlgorithm_value[opts.sigAlgorithm]
+	sa, ok := sigpb.DigitallySigned_SignatureAlgorithm_value[*signatureAlgorithm]
 	if !ok {
-		return nil, fmt.Errorf("unknown SignatureAlgorithm: %v", opts.sigAlgorithm)
+		return nil, fmt.Errorf("unknown SignatureAlgorithm: %v", *signatureAlgorithm)
 	}
 
-	pk, err := newPK(opts)
-	if err != nil {
-		return nil, err
-	}
-
-	tree := &trillian.Tree{
+	ctr := &trillian.CreateTreeRequest{Tree: &trillian.Tree{
 		TreeState:          trillian.TreeState(ts),
 		TreeType:           trillian.TreeType(tt),
 		HashStrategy:       trillian.HashStrategy(hs),
 		HashAlgorithm:      sigpb.DigitallySigned_HashAlgorithm(ha),
 		SignatureAlgorithm: sigpb.DigitallySigned_SignatureAlgorithm(sa),
-		DisplayName:        opts.displayName,
-		Description:        opts.description,
-		PrivateKey:         pk,
-	}
-	return &trillian.CreateTreeRequest{Tree: tree}, nil
-}
+		DisplayName:        *displayName,
+		Description:        *description,
+		MaxRootDuration:    ptypes.DurationProto(*maxRootDuration),
+	}}
 
-func newPK(opts *createOpts) (*any.Any, error) {
-	switch opts.privateKeyType {
-	case "PEMKeyFile":
-		if opts.pemKeyPath == "" {
-			return nil, errors.New("empty PEM path")
+	if *privateKeyFormat != "" {
+		pk, err := keys.New(*privateKeyFormat)
+		if err != nil {
+			return nil, err
 		}
-		if opts.pemKeyPass == "" {
-			return nil, fmt.Errorf("empty password for PEM key file %q", opts.pemKeyPath)
-		}
-		pemKey := &trillian.PEMKeyFile{
-			Path:     opts.pemKeyPath,
-			Password: opts.pemKeyPass,
-		}
-		return ptypes.MarshalAny(pemKey)
-	default:
-		return nil, fmt.Errorf("unknown private key type: %v", opts.privateKeyType)
-	}
-}
+		ctr.Tree.PrivateKey = pk
+	} else {
+		ctr.KeySpec = &keyspb.Specification{}
 
-func newOptsFromFlags() *createOpts {
-	return &createOpts{
-		addr:           *adminServerAddr,
-		treeState:      *treeState,
-		treeType:       *treeType,
-		hashStrategy:   *hashStrategy,
-		hashAlgorithm:  *hashAlgorithm,
-		sigAlgorithm:   *signatureAlgorithm,
-		displayName:    *displayName,
-		description:    *description,
-		privateKeyType: *privateKeyFormat,
-		pemKeyPath:     *pemKeyPath,
-		pemKeyPass:     *pemKeyPassword,
+		switch sigpb.DigitallySigned_SignatureAlgorithm(sa) {
+		case sigpb.DigitallySigned_ECDSA:
+			ctr.KeySpec.Params = &keyspb.Specification_EcdsaParams{
+				EcdsaParams: &keyspb.Specification_ECDSA{},
+			}
+		case sigpb.DigitallySigned_RSA:
+			ctr.KeySpec.Params = &keyspb.Specification_RsaParams{
+				RsaParams: &keyspb.Specification_RSA{},
+			}
+		default:
+			return nil, fmt.Errorf("unsupported signature algorithm: %v", sa)
+		}
 	}
+
+	return ctr, nil
 }
 
 func main() {
 	flag.Parse()
 
-	ctx := context.Background()
-	tree, err := createTree(ctx, newOptsFromFlags())
+	if *configFile != "" {
+		if err := cmd.ParseFlagFile(*configFile); err != nil {
+			glog.Exitf("Failed to load flags from config file %q: %s", *configFile, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *rpcDeadline)
+	defer cancel()
+	tree, err := createTree(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create tree: %v\n", err)
-		os.Exit(1)
+		glog.Exitf("Failed to create tree: %v", err)
 	}
 
 	// DO NOT change the output format, scripts are meant to depend on it.

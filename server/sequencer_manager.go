@@ -20,10 +20,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang/glog"
+	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
 	"github.com/google/trillian/crypto"
 	"github.com/google/trillian/extension"
 	"github.com/google/trillian/log"
+	"github.com/google/trillian/merkle/hashers"
 	"github.com/google/trillian/trees"
 )
 
@@ -65,7 +68,7 @@ func (s *SequencerManager) ExecutePass(ctx context.Context, logID int64, info *L
 	}
 	ctx = trees.NewContext(ctx, tree)
 
-	hasher, err := trees.Hasher(tree)
+	hasher, err := hashers.NewLogHasher(tree.HashStrategy)
 	if err != nil {
 		return 0, fmt.Errorf("error getting hasher for log %v: %v", logID, err)
 	}
@@ -75,10 +78,14 @@ func (s *SequencerManager) ExecutePass(ctx context.Context, logID int64, info *L
 		return 0, fmt.Errorf("error getting signer for log %v: %v", logID, err)
 	}
 
-	sequencer := log.NewSequencer(hasher, info.TimeSource, s.registry.LogStorage, signer)
-	sequencer.SetGuardWindow(s.guardWindow)
+	sequencer := log.NewSequencer(hasher, info.TimeSource, s.registry.LogStorage, signer, s.registry.MetricFactory, s.registry.QuotaManager)
 
-	leaves, err := sequencer.SequenceBatch(ctx, logID, info.BatchSize)
+	maxRootDuration, err := ptypes.Duration(tree.MaxRootDuration)
+	if err != nil {
+		glog.Warning("failed to parse tree.MaxRootDuration, using zero")
+		maxRootDuration = 0
+	}
+	leaves, err := sequencer.SequenceBatch(ctx, logID, info.BatchSize, s.guardWindow, maxRootDuration)
 	if err != nil {
 		return 0, fmt.Errorf("failed to sequence batch for %v: %v", logID, err)
 	}
@@ -95,7 +102,7 @@ func (s *SequencerManager) getSigner(ctx context.Context, tree *trillian.Tree) (
 		return signer, nil
 	}
 
-	signer, err := trees.Signer(ctx, s.registry.SignerFactory, tree)
+	signer, err := trees.Signer(ctx, tree)
 	if err != nil {
 		return nil, err
 	}

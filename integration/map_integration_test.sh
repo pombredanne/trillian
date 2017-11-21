@@ -1,51 +1,26 @@
 #!/bin/bash
 set -e
 INTEGRATION_DIR="$( cd "$( dirname "$0" )" && pwd )"
-. "${INTEGRATION_DIR}"/common.sh
+. "${INTEGRATION_DIR}"/functions.sh
 
-echo "Building code"
-go build ${GOFLAGS} ./cmd/createtree/
-go build ${GOFLAGS} ./server/vmap/trillian_map_server/
+echo "Launching core Trillian map components"
+map_prep_test 1
+TO_KILL+=(${RPC_SERVER_PIDS[@]})
 
-yes | "${SCRIPTS_DIR}"/resetdb.sh
-
-RPC_PORT=$(pickUnusedPort)
-
-echo "Starting Map RPC server on localhost:${RPC_PORT}"
-pushd "${TRILLIAN_ROOT}" > /dev/null
-./trillian_map_server --rpc_endpoint="localhost:${RPC_PORT}" http_endpoint='' &
-RPC_SERVER_PID=$!
-popd > /dev/null
-waitForServerStartup ${RPC_PORT}
-
-TEST_TREE_ID=$(./createtree \
-  --admin_server="localhost:${RPC_PORT}" \
-  --tree_type=MAP \
-  --pem_key_path=testdata/log-rpc-server.privkey.pem \
-  --pem_key_password=towel \
-  --signature_algorithm=ECDSA)
-echo "Created tree ${TEST_TREE_ID}"
-
-# Ensure we kill the RPC server once we're done.
-TO_KILL+=(${RPC_SERVER_PID})
-waitForServerStartup ${RPC_PORT}
-
-# Run the test(s):
+echo "Running test"
 cd "${INTEGRATION_DIR}"
 set +e
-go test -run ".*LiveMap.*" --timeout=5m ./ --map_id ${TEST_TREE_ID} --map_rpc_server="localhost:${RPC_PORT}"
+TRILLIAN_SQL_DRIVER=mysql go test ${GOFLAGS} \
+  -timeout=${GO_TEST_TIMEOUT:-5m} \
+  ./maptest  --map_rpc_server="${RPC_SERVER_1}"
 RESULT=$?
 set -e
 
-echo "Stopping MAP RPC server (pid ${RPC_SERVER_PID})"
-killPid ${RPC_SERVER_PID}
+map_stop_test
 TO_KILL=()
 
 if [ $RESULT != 0 ]; then
     sleep 1
-    if [ "$TMPDIR" == "" ]; then
-        TMPDIR=/tmp
-    fi
     echo "Server log:"
     echo "--------------------"
     cat "${TMPDIR}"/trillian_map_server.INFO

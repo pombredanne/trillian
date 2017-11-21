@@ -23,15 +23,24 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/any"
 	"github.com/google/trillian"
+	"github.com/google/trillian/crypto/keyspb"
 	spb "github.com/google/trillian/crypto/sigpb"
+	"github.com/google/trillian/errors"
 	"github.com/google/trillian/storage"
 )
 
 const (
 	defaultSequenceIntervalSeconds = 60
-	selectTrees                    = `
+
+	nonDeletedWhere = " WHERE (Deleted IS NULL OR Deleted = 'false')"
+
+	selectTreeIDs           = "SELECT TreeId FROM Trees"
+	selectNonDeletedTreeIDs = selectTreeIDs + nonDeletedWhere
+
+	selectTrees = `
 		SELECT
 			TreeId,
 			TreeState,
@@ -43,9 +52,14 @@ const (
 			Description,
 			CreateTimeMillis,
 			UpdateTimeMillis,
-			PrivateKey
+			PrivateKey,
+			PublicKey,
+			MaxRootDurationMillis,
+			Deleted,
+			DeleteTimeMillis
 		FROM Trees`
-	selectTreeByID = selectTrees + " WHERE TreeId = ?"
+	selectNonDeletedTrees = selectTrees + nonDeletedWhere
+	selectTreeByID        = selectTrees + " WHERE TreeId = ?"
 )
 
 // NewAdminStorage returns a MySQL storage.AdminStorage implementation backed by DB.
@@ -68,6 +82,10 @@ func (s *mysqlAdminStorage) Begin(ctx context.Context) (storage.AdminTX, error) 
 		return nil, err
 	}
 	return &adminTX{tx: tx}, nil
+}
+
+func (s *mysqlAdminStorage) CheckDatabaseAccessible(ctx context.Context) error {
+	return checkDatabaseAccessible(ctx, s.db)
 }
 
 type adminTX struct {
@@ -124,7 +142,17 @@ func (t *adminTX) GetTree(ctx context.Context, treeID int64) (*trillian.Tree, er
 		return nil, err
 	}
 	defer stmt.Close()
-	return readTree(stmt.QueryRowContext(ctx, treeID))
+
+	// GetTree is an entry point for most RPCs, let's provide somewhat nicer error messages.
+	tree, err := readTree(stmt.QueryRowContext(ctx, treeID))
+	switch {
+	case err == sql.ErrNoRows:
+		// ErrNoRows doesn't provide useful information, so we don't forward it.
+		return nil, errors.Errorf(errors.NotFound, "tree %v not found", treeID)
+	case err != nil:
+		return nil, fmt.Errorf("error reading tree %v: %v", treeID, err)
+	}
+	return tree, nil
 }
 
 // There's no common interface between sql.Row and sql.Rows(!), so we have to
@@ -138,9 +166,11 @@ func readTree(row row) (*trillian.Tree, error) {
 
 	// Enums and Datetimes need an extra conversion step
 	var treeState, treeType, hashStrategy, hashAlgorithm, signatureAlgorithm string
-	var createMillis, updateMillis int64
+	var createMillis, updateMillis, maxRootDurationMillis int64
 	var displayName, description sql.NullString
-	var privateKey []byte
+	var privateKey, publicKey []byte
+	var deleted sql.NullBool
+	var deleteMillis sql.NullInt64
 	err := row.Scan(
 		&tree.TreeId,
 		&treeState,
@@ -153,6 +183,10 @@ func readTree(row row) (*trillian.Tree, error) {
 		&createMillis,
 		&updateMillis,
 		&privateKey,
+		&publicKey,
+		&maxRootDurationMillis,
+		&deleted,
+		&deleteMillis,
 	)
 	if err != nil {
 		return nil, err
@@ -201,12 +235,28 @@ func readTree(row row) (*trillian.Tree, error) {
 			treeState, treeType, hashStrategy, hashAlgorithm, signatureAlgorithm)
 	}
 
-	tree.CreateTimeMillisSinceEpoch = createMillis
-	tree.UpdateTimeMillisSinceEpoch = updateMillis
+	tree.CreateTime, err = ptypes.TimestampProto(fromMillisSinceEpoch(createMillis))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse create time: %v", err)
+	}
+	tree.UpdateTime, err = ptypes.TimestampProto(fromMillisSinceEpoch(updateMillis))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse update time: %v", err)
+	}
+	tree.MaxRootDuration = ptypes.DurationProto(time.Duration(maxRootDurationMillis * int64(time.Millisecond)))
 
 	tree.PrivateKey = &any.Any{}
 	if err := proto.Unmarshal(privateKey, tree.PrivateKey); err != nil {
 		return nil, fmt.Errorf("could not unmarshal PrivateKey: %v", err)
+	}
+	tree.PublicKey = &keyspb.PublicKey{Der: publicKey}
+
+	tree.Deleted = deleted.Valid && deleted.Bool
+	if tree.Deleted && deleteMillis.Valid {
+		tree.DeleteTime, err = ptypes.TimestampProto(fromMillisSinceEpoch(deleteMillis.Int64))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse delete time: %v", err)
+		}
 	}
 
 	return tree, nil
@@ -219,8 +269,15 @@ func setNullStringIfValid(src sql.NullString, dest *string) {
 	}
 }
 
-func (t *adminTX) ListTreeIDs(ctx context.Context) ([]int64, error) {
-	stmt, err := t.tx.PrepareContext(ctx, "SELECT TreeId FROM Trees")
+func (t *adminTX) ListTreeIDs(ctx context.Context, includeDeleted bool) ([]int64, error) {
+	var query string
+	if includeDeleted {
+		query = selectTreeIDs
+	} else {
+		query = selectNonDeletedTreeIDs
+	}
+
+	stmt, err := t.tx.PrepareContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -243,8 +300,15 @@ func (t *adminTX) ListTreeIDs(ctx context.Context) ([]int64, error) {
 	return treeIDs, nil
 }
 
-func (t *adminTX) ListTrees(ctx context.Context) ([]*trillian.Tree, error) {
-	stmt, err := t.tx.PrepareContext(ctx, selectTrees)
+func (t *adminTX) ListTrees(ctx context.Context, includeDeleted bool) ([]*trillian.Tree, error) {
+	var query string
+	if includeDeleted {
+		query = selectTrees
+	} else {
+		query = selectNonDeletedTrees
+	}
+
+	stmt, err := t.tx.PrepareContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +330,7 @@ func (t *adminTX) ListTrees(ctx context.Context) ([]*trillian.Tree, error) {
 }
 
 func (t *adminTX) CreateTree(ctx context.Context, tree *trillian.Tree) (*trillian.Tree, error) {
-	if err := storage.ValidateTreeForCreation(tree); err != nil {
+	if err := storage.ValidateTreeForCreation(ctx, tree); err != nil {
 		return nil, err
 	}
 	if err := validateStorageSettings(tree); err != nil {
@@ -278,12 +342,24 @@ func (t *adminTX) CreateTree(ctx context.Context, tree *trillian.Tree) (*trillia
 		return nil, err
 	}
 
+	// Use the time truncated-to-millis throughout, as that's what's stored.
 	nowMillis := toMillisSinceEpoch(time.Now())
+	now := fromMillisSinceEpoch(nowMillis)
 
 	newTree := *tree
 	newTree.TreeId = id
-	newTree.CreateTimeMillisSinceEpoch = nowMillis
-	newTree.UpdateTimeMillisSinceEpoch = nowMillis
+	newTree.CreateTime, err = ptypes.TimestampProto(now)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build create time: %v", err)
+	}
+	newTree.UpdateTime, err = ptypes.TimestampProto(now)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build update time: %v", err)
+	}
+	rootDuration, err := ptypes.Duration(newTree.MaxRootDuration)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse MaxRootDuration: %v", err)
+	}
 
 	insertTreeStmt, err := t.tx.PrepareContext(
 		ctx,
@@ -298,8 +374,10 @@ func (t *adminTX) CreateTree(ctx context.Context, tree *trillian.Tree) (*trillia
 			Description,
 			CreateTimeMillis,
 			UpdateTimeMillis,
-			PrivateKey)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+			PrivateKey,
+			PublicKey,
+			MaxRootDurationMillis)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return nil, err
 	}
@@ -320,9 +398,11 @@ func (t *adminTX) CreateTree(ctx context.Context, tree *trillian.Tree) (*trillia
 		newTree.SignatureAlgorithm.String(),
 		newTree.DisplayName,
 		newTree.Description,
-		newTree.CreateTimeMillisSinceEpoch,
-		newTree.UpdateTimeMillisSinceEpoch,
+		nowMillis,
+		nowMillis,
 		privateKey,
+		newTree.PublicKey.GetDer(),
+		rootDuration/time.Millisecond,
 	)
 	if err != nil {
 		return nil, err
@@ -372,19 +452,34 @@ func (t *adminTX) UpdateTree(ctx context.Context, treeID int64, updateFunc func(
 
 	beforeUpdate := *tree
 	updateFunc(tree)
-	if err := storage.ValidateTreeForUpdate(&beforeUpdate, tree); err != nil {
+	if err := storage.ValidateTreeForUpdate(ctx, &beforeUpdate, tree); err != nil {
 		return nil, err
 	}
 	if err := validateStorageSettings(tree); err != nil {
 		return nil, err
 	}
 
-	tree.UpdateTimeMillisSinceEpoch = toMillisSinceEpoch(time.Now())
+	// Use the time truncated-to-millis throughout, as that's what's stored.
+	nowMillis := toMillisSinceEpoch(time.Now())
+	now := fromMillisSinceEpoch(nowMillis)
+	tree.UpdateTime, err = ptypes.TimestampProto(now)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build update time: %v", err)
+	}
+	rootDuration, err := ptypes.Duration(tree.MaxRootDuration)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse MaxRootDuration: %v", err)
+	}
+
+	privateKey, err := proto.Marshal(tree.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("could not marshal PrivateKey: %v", err)
+	}
 
 	stmt, err := t.tx.PrepareContext(
 		ctx,
 		`UPDATE Trees
-		SET TreeState = ?, DisplayName = ?, Description = ?, UpdateTimeMillis = ?
+		SET TreeState = ?, DisplayName = ?, Description = ?, UpdateTimeMillis = ?, MaxRootDurationMillis = ?, PrivateKey = ?
 		WHERE TreeId = ?`)
 	if err != nil {
 		return nil, err
@@ -396,7 +491,9 @@ func (t *adminTX) UpdateTree(ctx context.Context, treeID int64, updateFunc func(
 		tree.TreeState.String(),
 		tree.DisplayName,
 		tree.Description,
-		tree.UpdateTimeMillisSinceEpoch,
+		nowMillis,
+		rootDuration/time.Millisecond,
+		privateKey,
 		tree.TreeId); err != nil {
 		return nil, err
 	}
@@ -404,8 +501,68 @@ func (t *adminTX) UpdateTree(ctx context.Context, treeID int64, updateFunc func(
 	return tree, nil
 }
 
+func (t *adminTX) SoftDeleteTree(ctx context.Context, treeID int64) (*trillian.Tree, error) {
+	return t.updateDeleted(ctx, treeID, true /* deleted */, toMillisSinceEpoch(time.Now()) /* deleteTimeMillis */)
+}
+
+func (t *adminTX) UndeleteTree(ctx context.Context, treeID int64) (*trillian.Tree, error) {
+	return t.updateDeleted(ctx, treeID, false /* deleted */, nil /* deleteTimeMillis */)
+}
+
+// updateDeleted updates the Deleted and DeleteTimeMillis fields of the specified tree.
+// deleteTimeMillis must be either an int64 (in millis since epoch) or nil.
+func (t *adminTX) updateDeleted(ctx context.Context, treeID int64, deleted bool, deleteTimeMillis interface{}) (*trillian.Tree, error) {
+	if err := validateDeleted(ctx, t.tx, treeID, !deleted); err != nil {
+		return nil, err
+	}
+	if _, err := t.tx.ExecContext(
+		ctx,
+		"UPDATE Trees SET Deleted = ?, DeleteTimeMillis = ? WHERE TreeId = ?",
+		deleted, deleteTimeMillis, treeID); err != nil {
+		return nil, err
+	}
+	return t.GetTree(ctx, treeID)
+}
+
+func (t *adminTX) HardDeleteTree(ctx context.Context, treeID int64) error {
+	if err := validateDeleted(ctx, t.tx, treeID, true /* wantDeleted */); err != nil {
+		return err
+	}
+
+	// TreeControl didn't have "ON DELETE CASCADE" on previous versions, so let's hit it explicitly
+	if _, err := t.tx.ExecContext(ctx, "DELETE FROM TreeControl WHERE TreeId = ?", treeID); err != nil {
+		return err
+	}
+	_, err := t.tx.ExecContext(ctx, "DELETE FROM Trees WHERE TreeId = ?", treeID)
+	return err
+}
+
+func validateDeleted(ctx context.Context, tx *sql.Tx, treeID int64, wantDeleted bool) error {
+	var nullDeleted sql.NullBool
+	switch err := tx.QueryRowContext(ctx, "SELECT Deleted FROM Trees WHERE TreeId = ?", treeID).Scan(&nullDeleted); {
+	case err == sql.ErrNoRows:
+		return errors.Errorf(errors.NotFound, "tree %v not found", treeID)
+	case err != nil:
+		return err
+	}
+
+	switch deleted := nullDeleted.Valid && nullDeleted.Bool; {
+	case wantDeleted && !deleted:
+		return errors.Errorf(errors.FailedPrecondition, "tree %v is not soft deleted", treeID)
+	case !wantDeleted && deleted:
+		return errors.Errorf(errors.FailedPrecondition, "tree %v already soft deleted", treeID)
+	}
+	return nil
+}
+
 func toMillisSinceEpoch(t time.Time) int64 {
 	return t.UnixNano() / 1000000
+}
+
+func fromMillisSinceEpoch(ts int64) time.Time {
+	secs := int64(ts / 1000)
+	msecs := int64(ts % 1000)
+	return time.Unix(secs, msecs*1000000)
 }
 
 func validateStorageSettings(tree *trillian.Tree) error {

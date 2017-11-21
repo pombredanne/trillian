@@ -19,11 +19,14 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/golang/glog"
 	"github.com/google/trillian/extension"
+	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/util"
 )
 
@@ -31,7 +34,24 @@ const (
 	minPreElectionPause    = 10 * time.Millisecond
 	minMasterCheckInterval = 50 * time.Millisecond
 	minMasterHoldInterval  = 10 * time.Second
+	logIDLabel             = "logid"
 )
+
+var (
+	once         sync.Once
+	knownLogs    monitoring.Gauge
+	resignations monitoring.Counter
+	isMaster     monitoring.Gauge
+)
+
+func createMetrics(mf monitoring.MetricFactory) {
+	if mf == nil {
+		mf = monitoring.InertMetricFactory{}
+	}
+	knownLogs = mf.NewGauge("known_logs", "Set to 1 for known logs (whether this instance is master or not)", logIDLabel)
+	resignations = mf.NewCounter("master_resignations", "Number of mastership resignations", logIDLabel)
+	isMaster = mf.NewGauge("is_master", "Whether this instance is master (0/1)", logIDLabel)
+}
 
 // LogOperation defines a task that operates on a log. Examples are scheduling, signing,
 // consistency checking or cleanup.
@@ -88,6 +108,7 @@ type electionRunner struct {
 
 func (er *electionRunner) Run(ctx context.Context) {
 	defer er.wg.Done()
+	label := strconv.FormatInt(er.logID, 10)
 
 	// Pause for a random interval so that if multiple instances start at the same
 	// time there is less of a thundering herd.
@@ -112,6 +133,7 @@ func (er *electionRunner) Run(ctx context.Context) {
 		}
 		glog.V(1).Infof("%d: Now, I am the master", er.logID)
 		er.tracker.Set(er.logID, true)
+		isMaster.Set(1.0, label)
 		masterSince := time.Now()
 
 		// While-master loop
@@ -131,12 +153,15 @@ func (er *electionRunner) Run(ctx context.Context) {
 			if !master {
 				glog.Errorf("%d: no longer the master!", er.logID)
 				er.tracker.Set(er.logID, false)
+				isMaster.Set(0.0, label)
 				break
 			}
 			if er.shouldResign(masterSince) {
 				glog.Infof("%d: deliberately resigning mastership", er.logID)
+				resignations.Inc(label)
 				if err := er.election.ResignAndRestart(ctx); err == nil {
 					er.tracker.Set(er.logID, false)
+					isMaster.Set(0.0, label)
 					break
 				}
 				glog.Errorf("%d: failed to resign mastership", er.logID)
@@ -173,6 +198,9 @@ type LogOperationManager struct {
 	tracker        *util.MasterTracker
 	heldMutex      sync.Mutex
 	lastHeld       []int64
+	// Cache of logID => name; assumed not to change during runtime
+	logNamesMutex sync.Mutex
+	logNames      map[int64]string
 }
 
 // fixupElectionInfo ensures operation parameters have required minimum values.
@@ -194,10 +222,14 @@ func fixupElectionInfo(info LogOperationInfo) LogOperationInfo {
 
 // NewLogOperationManager creates a new LogOperationManager instance.
 func NewLogOperationManager(info LogOperationInfo, logOperation LogOperation) *LogOperationManager {
+	once.Do(func() {
+		createMetrics(info.Registry.MetricFactory)
+	})
 	return &LogOperationManager{
 		info:           fixupElectionInfo(info),
 		logOperation:   logOperation,
 		electionRunner: make(map[int64]*electionRunner),
+		logNames:       make(map[int64]string),
 	}
 }
 
@@ -220,6 +252,50 @@ func (l *LogOperationManager) getLogIDs(ctx context.Context) ([]int64, error) {
 	return logIDs, nil
 }
 
+// logName maps a logID to a human-readable name, caching results along the way.
+// The human-readable name may non-unique so should only be used for diagnostics.
+func (l *LogOperationManager) logName(ctx context.Context, logID int64) string {
+	l.logNamesMutex.Lock()
+	defer l.logNamesMutex.Unlock()
+	if name, ok := l.logNames[logID]; ok {
+		return name
+	}
+	tx, err := l.info.Registry.AdminStorage.Snapshot(ctx)
+	if err != nil {
+		glog.Errorf("%v: failed to start transaction: %v", logID, err)
+		return "<err>"
+	}
+	defer tx.Close()
+	tree, err := tx.GetTree(ctx, logID)
+	if err != nil {
+		glog.Errorf("%v: failed to get log info: %v", logID, err)
+		return "<err>"
+	}
+	if err := tx.Commit(); err != nil {
+		return "<err>"
+	}
+	name := tree.DisplayName
+	if name == "" {
+		name = fmt.Sprintf("<log-%d>", logID)
+	}
+	l.logNames[logID] = name
+	return l.logNames[logID]
+}
+
+func (l *LogOperationManager) heldInfo(ctx context.Context, logIDs []int64) string {
+	names := make([]string, 0, len(logIDs))
+	for _, logID := range logIDs {
+		names = append(names, l.logName(ctx, logID))
+	}
+	sort.Strings(names)
+
+	result := "master for:"
+	for _, name := range names {
+		result += " " + name
+	}
+	return result
+}
+
 func (l *LogOperationManager) masterFor(ctx context.Context, allIDs []int64) ([]int64, error) {
 	if l.info.Registry.ElectionFactory == nil {
 		return allIDs, nil
@@ -231,6 +307,7 @@ func (l *LogOperationManager) masterFor(ctx context.Context, allIDs []int64) ([]
 
 	// Synchronize the set of configured log IDs with those we are tracking mastership for.
 	for _, logID := range allIDs {
+		knownLogs.Set(1.0, strconv.FormatInt(logID, 10))
 		if l.electionRunner[logID] != nil {
 			continue
 		}
@@ -258,13 +335,17 @@ func (l *LogOperationManager) masterFor(ctx context.Context, allIDs []int64) ([]
 	return held, nil
 }
 
-func (l *LogOperationManager) updateHeldIDs(logIDs, allIDs []int64) {
+func (l *LogOperationManager) updateHeldIDs(ctx context.Context, logIDs, allIDs []int64) {
 	l.heldMutex.Lock()
 	defer l.heldMutex.Unlock()
 	if !reflect.DeepEqual(logIDs, l.lastHeld) {
 		l.lastHeld = make([]int64, len(logIDs))
 		copy(l.lastHeld, logIDs)
-		glog.Infof("now acting as master for %d / %d: %s", len(logIDs), len(allIDs), util.HeldInfo(logIDs, allIDs))
+		heldInfo := l.heldInfo(ctx, logIDs)
+		glog.Infof("now acting as master for %d / %d, %s", len(logIDs), len(allIDs), heldInfo)
+		if l.info.Registry.SetProcessStatus != nil {
+			l.info.Registry.SetProcessStatus(heldInfo)
+		}
 	}
 }
 
@@ -277,7 +358,7 @@ func (l *LogOperationManager) getLogsAndExecutePass(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to determine log IDs we're master for: %v", err)
 	}
-	l.updateHeldIDs(logIDs, allIDs)
+	l.updateHeldIDs(ctx, logIDs, allIDs)
 
 	numWorkers := l.info.NumWorkers
 	if numWorkers == 0 {
@@ -312,30 +393,31 @@ func (l *LogOperationManager) getLogsAndExecutePass(ctx context.Context) error {
 
 				start := time.Now()
 				count, err := l.logOperation.ExecutePass(ctx, logID, &l.info)
-
-				if err == nil {
-					if count > 0 {
-						d := time.Now().Sub(start).Seconds()
-						glog.Infof("%v: processed %d items in %.2f seconds (%.2f qps)", logID, count, d, float64(count)/d)
-					} else {
-						glog.V(1).Infof("%v: no items to process", logID)
-					}
-					mu.Lock()
-					successCount++
-					itemCount += count
-					mu.Unlock()
+				if err != nil {
+					glog.Errorf("ExecutePass(%v) failed: %v", logID, err)
+					continue
 				}
+
+				if count > 0 {
+					d := time.Since(start).Seconds()
+					glog.Infof("%v: processed %d items in %.2f seconds (%.2f qps)", logID, count, d, float64(count)/d)
+				} else {
+					glog.V(1).Infof("%v: no items to process", logID)
+				}
+				mu.Lock()
+				successCount++
+				itemCount += count
+				mu.Unlock()
 			}
 		}()
 	}
 
 	// Wait for the workers to consume all of the logIDs
 	wg.Wait()
-	d := time.Now().Sub(startBatch).Seconds()
-	glog.V(1).Infof("Group run completed in %.2f seconds: %v succeeded, %v failed, %v items processed", d, successCount, len(logIDs)-successCount, itemCount)
+	d := time.Since(startBatch).Seconds()
+	glog.Infof("Group run completed in %.2f seconds: %v succeeded, %v failed, %v items processed", d, successCount, len(logIDs)-successCount, itemCount)
 
 	return nil
-
 }
 
 // OperationSingle performs a single pass of the manager.
@@ -370,7 +452,7 @@ loop:
 		}
 
 		// Wait for the configured time before going for another pass
-		duration := time.Now().Sub(start)
+		duration := time.Since(start)
 		wait := l.info.RunInterval - duration
 		if wait > 0 {
 			glog.V(1).Infof("Processing started at %v for %v; wait %v before next run", start, duration, wait)

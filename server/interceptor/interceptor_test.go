@@ -17,35 +17,47 @@ package interceptor
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/golang/mock/gomock"
 	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
-	terrors "github.com/google/trillian/errors"
-	serrors "github.com/google/trillian/server/errors"
+	"github.com/google/trillian/quota"
+	"github.com/google/trillian/quota/etcd/quotapb"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/testonly"
 	"github.com/google/trillian/trees"
 	"github.com/kylelemons/godebug/pretty"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	terrors "github.com/google/trillian/errors"
+	serrors "github.com/google/trillian/server/errors"
 )
 
-func TestTreeInterceptor_UnaryInterceptor(t *testing.T) {
+func TestTrillianInterceptor_TreeInterception(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	logTree := *testonly.LogTree
+	logTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
 	logTree.TreeId = 10
-	mapTree := *testonly.MapTree
+	mapTree := proto.Clone(testonly.MapTree).(*trillian.Tree)
 	mapTree.TreeId = 11
+	deletedTree := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	deletedTree.TreeId = 12
+	deletedTree.Deleted = true
+	deletedTree.DeleteTime = ptypes.TimestampNow()
 	unknownTreeID := int64(999)
 
 	admin := storage.NewMockAdminStorage(ctrl)
 	adminTX := storage.NewMockReadOnlyAdminTX(ctrl)
 	admin.EXPECT().Snapshot(gomock.Any()).AnyTimes().Return(adminTX, nil)
-	adminTX.EXPECT().GetTree(gomock.Any(), logTree.TreeId).AnyTimes().Return(&logTree, nil)
-	adminTX.EXPECT().GetTree(gomock.Any(), mapTree.TreeId).AnyTimes().Return(&mapTree, nil)
+	adminTX.EXPECT().GetTree(gomock.Any(), logTree.TreeId).AnyTimes().Return(logTree, nil)
+	adminTX.EXPECT().GetTree(gomock.Any(), mapTree.TreeId).AnyTimes().Return(mapTree, nil)
+	adminTX.EXPECT().GetTree(gomock.Any(), deletedTree.TreeId).AnyTimes().Return(deletedTree, nil)
 	adminTX.EXPECT().GetTree(gomock.Any(), unknownTreeID).AnyTimes().Return(nil, errors.New("not found"))
 	adminTX.EXPECT().Close().AnyTimes().Return(nil)
 	adminTX.EXPECT().Commit().AnyTimes().Return(nil)
@@ -53,56 +65,73 @@ func TestTreeInterceptor_UnaryInterceptor(t *testing.T) {
 	tests := []struct {
 		desc       string
 		req        interface{}
-		fullMethod string
 		handlerErr error
 		wantErr    bool
 		wantTree   *trillian.Tree
+		cancelled  bool
 	}{
+		// TODO(codingllama): Admin requests don't benefit from tree-reading logic, but we may read
+		// their tree IDs for auth purposes.
 		{
-			desc:       "rpcWithoutTree",
-			req:        &trillian.CreateTreeRequest{},
-			fullMethod: "/trillian.TrillianAdmin/CreateTree",
+			desc: "adminReadByID",
+			req:  &trillian.GetTreeRequest{TreeId: logTree.TreeId},
 		},
 		{
-			desc:       "adminRPC",
-			req:        &trillian.GetTreeRequest{TreeId: logTree.TreeId},
-			fullMethod: "/trillian.TrillianAdmin/GetTree",
-			wantTree:   &logTree,
+			desc: "adminWriteByID",
+			req:  &trillian.DeleteTreeRequest{TreeId: logTree.TreeId},
 		},
 		{
-			desc:       "logRPC",
-			req:        &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
-			fullMethod: "/trillian.TrillianLog/GetLatestSignedLogRoot",
-			wantTree:   &logTree,
+			desc: "adminWriteByTree",
+			req:  &trillian.UpdateTreeRequest{Tree: &trillian.Tree{TreeId: logTree.TreeId}},
 		},
 		{
-			desc:       "mapRPC",
-			req:        &trillian.GetSignedMapRootRequest{MapId: mapTree.TreeId},
-			fullMethod: "/trillian.TrillianMap/GetSignedMapRoot",
-			wantTree:   &mapTree,
+			desc:     "logRPC",
+			req:      &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
+			wantTree: logTree,
 		},
 		{
-			desc:       "unknownRequest",
-			req:        "not-a-request",
-			fullMethod: "/trillian.TrillianLog/UnmappedRequest",
-			wantErr:    true,
+			desc:     "mapRPC",
+			req:      &trillian.GetSignedMapRootRequest{MapId: mapTree.TreeId},
+			wantTree: mapTree,
 		},
 		{
-			desc:       "unknownTree",
-			req:        &trillian.GetTreeRequest{TreeId: unknownTreeID},
-			fullMethod: "/trillian.TrillianAdmin/GetTree",
-			wantErr:    true,
+			desc:    "unknownRequest",
+			req:     "not-a-request",
+			wantErr: true,
+		},
+		{
+			desc:    "unknownTree",
+			req:     &trillian.GetLatestSignedLogRootRequest{LogId: unknownTreeID},
+			wantErr: true,
+		},
+		{
+			desc:    "deletedTree",
+			req:     &trillian.GetLatestSignedLogRootRequest{LogId: deletedTree.TreeId},
+			wantErr: true,
+		},
+		{
+			desc:      "cancelled",
+			req:       &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
+			cancelled: true,
+			wantErr:   true,
 		},
 	}
 
 	ctx := context.Background()
-	intercept := TreeInterceptor{Admin: admin}
+	intercept := New(admin, quota.Noop(), false /* quotaDryRun */, nil /* mf */)
 	for _, test := range tests {
 		handler := &fakeHandler{resp: "handler response", err: test.handlerErr}
 
-		resp, err := intercept.UnaryInterceptor(ctx, test.req, &grpc.UnaryServerInfo{FullMethod: test.fullMethod}, handler.run)
+		if test.cancelled {
+			// Use a context that's already been cancelled
+			newCtx, cancel := context.WithCancel(ctx)
+			cancel()
+			ctx = newCtx
+		}
+
+		resp, err := intercept.UnaryInterceptor(ctx, test.req, &grpc.UnaryServerInfo{}, handler.run)
 		if hasErr := err != nil && err != test.handlerErr; hasErr != test.wantErr {
-			t.Errorf("%v: UnaryInterceptor() returned err = %q, wantErr = %v", test.desc, err, test.wantErr)
+			t.Errorf("%v: UnaryInterceptor() returned err = %v, wantErr = %v", test.desc, err, test.wantErr)
 			continue
 		} else if hasErr {
 			continue
@@ -131,113 +160,387 @@ func TestTreeInterceptor_UnaryInterceptor(t *testing.T) {
 	}
 }
 
-func TestGetRPCInfo(t *testing.T) {
+func TestTrillianInterceptor_QuotaInterception(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	logTree := *testonly.LogTree
+	logTree.TreeId = 10
+
+	mapTree := *testonly.MapTree
+	mapTree.TreeId = 11
+
+	admin := storage.NewMockAdminStorage(ctrl)
+	adminTX := storage.NewMockReadOnlyAdminTX(ctrl)
+	admin.EXPECT().Snapshot(gomock.Any()).AnyTimes().Return(adminTX, nil)
+	adminTX.EXPECT().GetTree(gomock.Any(), logTree.TreeId).AnyTimes().Return(&logTree, nil)
+	adminTX.EXPECT().GetTree(gomock.Any(), mapTree.TreeId).AnyTimes().Return(&mapTree, nil)
+	adminTX.EXPECT().Close().AnyTimes().Return(nil)
+	adminTX.EXPECT().Commit().AnyTimes().Return(nil)
+
+	user := "llama"
 	tests := []struct {
-		desc                              string
-		req                               interface{}
-		fullMethod                        string
-		wantID                            int64
-		wantType                          trillian.TreeType
-		wantNoTree, wantReadonly, wantErr bool
+		desc         string
+		dryRun       bool
+		req          interface{}
+		specs        []quota.Spec
+		getTokensErr error
+		wantCode     codes.Code
+		wantTokens   int
 	}{
 		{
-			desc:       "noTree1",
-			req:        &trillian.CreateTreeRequest{},
-			fullMethod: "/trillian.TrillianAdmin/CreateTree",
-			wantNoTree: true,
+			desc: "logRead",
+			req:  &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Read, User: user},
+				{Group: quota.Tree, Kind: quota.Read, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Read},
+			},
+			wantTokens: 1,
 		},
 		{
-			desc:       "noTree2",
-			req:        &trillian.ListTreesRequest{},
-			fullMethod: "/trillian.TrillianAdmin/ListTrees",
-			wantNoTree: true,
+			desc: "logWrite",
+			req:  &trillian.QueueLeafRequest{LogId: logTree.TreeId},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Write, User: user},
+				{Group: quota.Tree, Kind: quota.Write, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Write},
+			},
+			wantTokens: 1,
 		},
 		{
-			desc:         "getAdminRequest",
-			req:          &trillian.GetTreeRequest{TreeId: 10},
-			fullMethod:   "/trillian.TrillianAdmin/GetTree",
-			wantID:       10,
-			wantReadonly: true,
+			desc: "mapRead",
+			req:  &trillian.GetMapLeavesRequest{MapId: mapTree.TreeId},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Read, User: user},
+				{Group: quota.Tree, Kind: quota.Read, TreeID: mapTree.TreeId},
+				{Group: quota.Global, Kind: quota.Read},
+			},
+			wantTokens: 1,
 		},
 		{
-			desc:       "rwTreeIDAdminRequest",
-			req:        &trillian.DeleteTreeRequest{TreeId: 10},
-			fullMethod: "/trillian.TrillianAdmin/DeleteTree",
-			wantID:     10,
+			desc: "emptyBatchRequest",
+			req: &trillian.QueueLeavesRequest{
+				LogId:  logTree.TreeId,
+				Leaves: nil,
+			},
 		},
 		{
-			desc:       "rwTreeAdminRequest",
-			req:        &trillian.UpdateTreeRequest{Tree: &trillian.Tree{TreeId: 10}},
-			fullMethod: "/trillian.TrillianAdmin/UpdateTree",
-			wantID:     10,
+			desc: "batchLogLeavesRequest",
+			req: &trillian.QueueLeavesRequest{
+				LogId:  logTree.TreeId,
+				Leaves: []*trillian.LogLeaf{{}, {}, {}},
+			},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Write, User: user},
+				{Group: quota.Tree, Kind: quota.Write, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Write},
+			},
+			wantTokens: 3,
 		},
 		{
-			desc:         "getLogRequest",
-			req:          &trillian.GetConsistencyProofRequest{LogId: 20},
-			fullMethod:   "/trillian.TrillianLog/GetConsistencyProof",
-			wantID:       20,
-			wantType:     trillian.TreeType_LOG,
-			wantReadonly: true,
+			desc: "batchMapLeavesRequest",
+			req: &trillian.SetMapLeavesRequest{
+				MapId:  mapTree.TreeId,
+				Leaves: []*trillian.MapLeaf{{}, {}, {}, {}, {}},
+			},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Write, User: user},
+				{Group: quota.Tree, Kind: quota.Write, TreeID: mapTree.TreeId},
+				{Group: quota.Global, Kind: quota.Write},
+			},
+			wantTokens: 5,
 		},
 		{
-			desc:       "rwLogRequest",
-			req:        &trillian.QueueLeafRequest{LogId: 20},
-			fullMethod: "/trillian.TrillianLog/QueueLeaf",
-			wantID:     20,
-			wantType:   trillian.TreeType_LOG,
+			desc: "quotaError",
+			req:  &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Read, User: user},
+				{Group: quota.Tree, Kind: quota.Read, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Read},
+			},
+			getTokensErr: errors.New("not enough tokens"),
+			wantCode:     codes.ResourceExhausted,
+			wantTokens:   1,
 		},
 		{
-			desc:         "getMapRequest",
-			req:          &trillian.GetMapLeavesRequest{MapId: 30},
-			fullMethod:   "/trillian.TrillianMap/GetMapLeaves",
-			wantID:       30,
-			wantType:     trillian.TreeType_MAP,
-			wantReadonly: true,
-		},
-		{
-			desc:       "rwMapRequest",
-			req:        &trillian.SetMapLeavesRequest{MapId: 30},
-			fullMethod: "/trillian.TrillianMap/SetMapLeaves",
-			wantID:     30,
-			wantType:   trillian.TreeType_MAP,
-		},
-		{
-			desc:       "unknownRequestType",
-			req:        "not-a-request",
-			fullMethod: "/trillian.TrillianAdmin/GetTree",
-			wantErr:    true,
-		},
-		{
-			desc:       "malformedFullMethod",
-			req:        &trillian.GetTreeRequest{TreeId: 40},
-			fullMethod: "not-a-full-method",
-			wantErr:    true,
-		},
-		{
-			desc:       "unknownServiceName",
-			req:        &trillian.GetTreeRequest{TreeId: 40},
-			fullMethod: "/trillian.FooService/GetTree",
-			wantErr:    true,
+			desc:   "quotaDryRunError",
+			dryRun: true,
+			req:    &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Read, User: user},
+				{Group: quota.Tree, Kind: quota.Read, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Read},
+			},
+			getTokensErr: errors.New("not enough tokens"),
+			wantTokens:   1,
 		},
 	}
+
+	ctx := context.Background()
 	for _, test := range tests {
-		info, err := getRPCInfo(test.req, test.fullMethod)
-		if hasErr := err != nil; hasErr != test.wantErr {
-			t.Errorf("%v: getRPCInfo(%T) returned err = %v, wantErr = %v", test.desc, test.req, err, test.wantErr)
+		qm := quota.NewMockManager(ctrl)
+		qm.EXPECT().GetUser(gomock.Any(), test.req).MaxTimes(1).Return(user)
+		if test.wantTokens > 0 {
+			qm.EXPECT().GetTokens(gomock.Any(), test.wantTokens, test.specs).Return(test.getTokensErr)
+		}
+
+		handler := &fakeHandler{resp: "ok"}
+		intercept := New(admin, qm, test.dryRun, nil /* mf */)
+
+		// resp and handler assertions are done by TestTrillianInterceptor_TreeInterception,
+		// we're only concerned with the quota logic here.
+		_, err := intercept.UnaryInterceptor(ctx, test.req, &grpc.UnaryServerInfo{}, handler.run)
+		if s, ok := status.FromError(err); !ok || s.Code() != test.wantCode {
+			t.Errorf("%v: UnaryInterceptor() returned err = %q, wantCode = %v", test.desc, err, test.wantCode)
+		}
+	}
+}
+
+func TestTrillianInterceptor_QuotaInterception_ReturnsTokens(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	logTree := *testonly.LogTree
+	logTree.TreeId = 10
+
+	admin := storage.NewMockAdminStorage(ctrl)
+	adminTX := storage.NewMockReadOnlyAdminTX(ctrl)
+	admin.EXPECT().Snapshot(gomock.Any()).AnyTimes().Return(adminTX, nil)
+	adminTX.EXPECT().GetTree(gomock.Any(), logTree.TreeId).AnyTimes().Return(&logTree, nil)
+	adminTX.EXPECT().Close().AnyTimes().Return(nil)
+	adminTX.EXPECT().Commit().AnyTimes().Return(nil)
+
+	user := "llama"
+	tests := []struct {
+		desc                         string
+		req, resp                    interface{}
+		specs                        []quota.Spec
+		handlerErr                   error
+		wantGetTokens, wantPutTokens int
+	}{
+		{
+			desc: "badRequest",
+			req:  &trillian.GetLatestSignedLogRootRequest{LogId: logTree.TreeId},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Read, User: user},
+				{Group: quota.Tree, Kind: quota.Read, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Read},
+			},
+			handlerErr:    errors.New("bad request"),
+			wantGetTokens: 1,
+			wantPutTokens: 1,
+		},
+		{
+			desc: "newLeaf",
+			req:  &trillian.QueueLeafRequest{LogId: logTree.TreeId, Leaf: &trillian.LogLeaf{}},
+			resp: &trillian.QueueLeafResponse{QueuedLeaf: &trillian.QueuedLogLeaf{}},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Write, User: user},
+				{Group: quota.Tree, Kind: quota.Write, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Write},
+			},
+			wantGetTokens: 1,
+		},
+		{
+			desc: "duplicateLeaf",
+			req:  &trillian.QueueLeafRequest{LogId: logTree.TreeId},
+			resp: &trillian.QueueLeafResponse{
+				QueuedLeaf: &trillian.QueuedLogLeaf{
+					Status: status.New(codes.AlreadyExists, "duplicate leaf").Proto(),
+				},
+			},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Write, User: user},
+				{Group: quota.Tree, Kind: quota.Write, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Write},
+			},
+			wantGetTokens: 1,
+			wantPutTokens: 1,
+		},
+		{
+			desc: "newLeaves",
+			req: &trillian.QueueLeavesRequest{
+				LogId:  logTree.TreeId,
+				Leaves: []*trillian.LogLeaf{{}, {}, {}},
+			},
+			resp: &trillian.QueueLeavesResponse{
+				QueuedLeaves: []*trillian.QueuedLogLeaf{{}, {}, {}}, // No explicit Status means OK
+			},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Write, User: user},
+				{Group: quota.Tree, Kind: quota.Write, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Write},
+			},
+			wantGetTokens: 3,
+		},
+		{
+			desc: "duplicateLeaves",
+			req: &trillian.QueueLeavesRequest{
+				LogId:  logTree.TreeId,
+				Leaves: []*trillian.LogLeaf{{}, {}, {}},
+			},
+			resp: &trillian.QueueLeavesResponse{
+				QueuedLeaves: []*trillian.QueuedLogLeaf{
+					{Status: status.New(codes.AlreadyExists, "duplicate leaf").Proto()},
+					{Status: status.New(codes.AlreadyExists, "duplicate leaf").Proto()},
+					{},
+				},
+			},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Write, User: user},
+				{Group: quota.Tree, Kind: quota.Write, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Write},
+			},
+			wantGetTokens: 3,
+			wantPutTokens: 2,
+		},
+		{
+			desc: "badQueueLeavesRequest",
+			req: &trillian.QueueLeavesRequest{
+				LogId:  logTree.TreeId,
+				Leaves: []*trillian.LogLeaf{{}, {}, {}},
+			},
+			specs: []quota.Spec{
+				{Group: quota.User, Kind: quota.Write, User: user},
+				{Group: quota.Tree, Kind: quota.Write, TreeID: logTree.TreeId},
+				{Group: quota.Global, Kind: quota.Write},
+			},
+			handlerErr:    errors.New("bad request"),
+			wantGetTokens: 3,
+			wantPutTokens: 3,
+		},
+	}
+
+	defer func(timeout time.Duration) {
+		PutTokensTimeout = timeout
+	}(PutTokensTimeout)
+	PutTokensTimeout = 5 * time.Second
+
+	// Use a ctx with a timeout smaller than PutTokensTimeout. Not too short or
+	// spurious failures will occur when the deadline expires.
+	ctx, cancel := context.WithTimeout(context.Background(), PutTokensTimeout-2*time.Second)
+	defer cancel()
+
+	for _, test := range tests {
+		putTokensCh := make(chan bool, 1)
+		wantDeadline := time.Now().Add(PutTokensTimeout)
+
+		qm := quota.NewMockManager(ctrl)
+		qm.EXPECT().GetUser(gomock.Any(), test.req).MaxTimes(1).Return(user)
+		if test.wantGetTokens > 0 {
+			qm.EXPECT().GetTokens(gomock.Any(), test.wantGetTokens, test.specs).Return(nil)
+		}
+		if test.wantPutTokens > 0 {
+			qm.EXPECT().PutTokens(gomock.Any(), test.wantPutTokens, test.specs).Do(func(ctx context.Context, numTokens int, specs []quota.Spec) {
+				switch d, ok := ctx.Deadline(); {
+				case !ok:
+					t.Errorf("%v: PutTokens() ctx has no deadline: %v", test.desc, ctx)
+				case d.Before(wantDeadline):
+					t.Errorf("%v: PutTokens() ctx deadline too short, got %v, want >= %v", test.desc, d, wantDeadline)
+				}
+				putTokensCh <- true
+			}).Return(nil)
+		}
+
+		handler := &fakeHandler{resp: test.resp, err: test.handlerErr}
+		intercept := New(admin, qm, false /* quotaDryRun */, nil /* mf */)
+
+		if _, err := intercept.UnaryInterceptor(ctx, test.req, &grpc.UnaryServerInfo{}, handler.run); err != test.handlerErr {
+			t.Errorf("%v: UnaryInterceptor() returned err = [%v], want = [%v]", test.desc, err, test.handlerErr)
+		}
+
+		// PutTokens may be delegated to a separate goroutine. Give it some time to complete.
+		select {
+		case <-putTokensCh:
+			// OK
+		case <-time.After(1 * time.Second):
+			// No need to error here, gomock will fail if the call is missing.
+		}
+	}
+}
+
+func TestTrillianInterceptor_NotIntercepted(t *testing.T) {
+	tests := []struct {
+		req interface{}
+	}{
+		// Admin
+		{req: &trillian.CreateTreeRequest{}},
+		{req: &trillian.ListTreesRequest{}},
+		// Quota
+		{req: &quotapb.CreateConfigRequest{}},
+		{req: &quotapb.DeleteConfigRequest{}},
+		{req: &quotapb.GetConfigRequest{}},
+		{req: &quotapb.ListConfigsRequest{}},
+		{req: &quotapb.UpdateConfigRequest{}},
+	}
+
+	ctx := context.Background()
+	for _, test := range tests {
+		handler := &fakeHandler{}
+		intercept := New(nil /* admin */, quota.Noop(), false /* quotaDryRun */, nil /* mf */)
+		if _, err := intercept.UnaryInterceptor(ctx, test.req, &grpc.UnaryServerInfo{}, handler.run); err != nil {
+			t.Errorf("UnaryInterceptor(%#v) returned err = %v", test.req, err)
+		}
+		if !handler.called {
+			t.Errorf("UnaryInterceptor(%#v): handler not called", test.req)
+		}
+	}
+}
+
+// TestTrillianInterceptor_BeforeAfter tests a few Before/After interactions that are
+// difficult/impossible to get unless the methods are called separately (i.e., not via
+// UnaryInterceptor()).
+func TestTrillianInterceptor_BeforeAfter(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	logTree := *testonly.LogTree
+	logTree.TreeId = 10
+
+	admin := storage.NewMockAdminStorage(ctrl)
+	adminTX := storage.NewMockReadOnlyAdminTX(ctrl)
+	admin.EXPECT().Snapshot(gomock.Any()).AnyTimes().Return(adminTX, nil)
+	adminTX.EXPECT().GetTree(gomock.Any(), logTree.TreeId).AnyTimes().Return(&logTree, nil)
+	adminTX.EXPECT().Close().AnyTimes().Return(nil)
+	adminTX.EXPECT().Commit().AnyTimes().Return(nil)
+
+	qm := quota.Noop()
+
+	tests := []struct {
+		desc          string
+		req, resp     interface{}
+		handlerErr    error
+		wantBeforeErr bool
+	}{
+		{
+			desc: "success",
+			req:  &trillian.CreateTreeRequest{},
+			resp: &trillian.Tree{},
+		},
+		{
+			desc:          "badRequest",
+			req:           "bad",
+			resp:          nil,
+			handlerErr:    errors.New("bad"),
+			wantBeforeErr: true,
+		},
+	}
+
+	ctx := context.Background()
+	for _, test := range tests {
+		intercept := New(admin, qm, false /* quotaDryRun */, nil /* mf */)
+		p := intercept.NewProcessor()
+
+		_, err := p.Before(ctx, test.req)
+		if gotErr := err != nil; gotErr != test.wantBeforeErr {
+			t.Errorf("%v: Before() returned err = %v, wantErr = %v", test.desc, err, test.wantBeforeErr)
 			continue
-		} else if hasErr {
-			continue
 		}
-		if got, want := info.doesNotHaveTree, test.wantNoTree; got != want {
-			t.Errorf("%v: info.doesNotHaveTree = %v, want = %v", test.desc, got, want)
-		}
-		if got, want := info.treeID, test.wantID; got != want {
-			t.Errorf("%v: info.treeID = %v, want = %v", test.desc, got, want)
-		}
-		wantOpts := &trees.GetOpts{TreeType: test.wantType, Readonly: test.wantReadonly}
-		if diff := pretty.Compare(info.opts, wantOpts); diff != "" {
-			t.Errorf("%v: info.opts diff:\n%v", test.desc, diff)
-		}
+
+		// Other TrillianInterceptor tests assert After side-effects more in-depth, silently
+		// returning is good enough here.
+		p.After(ctx, test.resp, test.handlerErr)
 	}
 }
 
@@ -358,7 +661,7 @@ func TestCombine(t *testing.T) {
 	}
 }
 
-func TestWrapErrors(t *testing.T) {
+func TestErrorWrapper(t *testing.T) {
 	badLlamaErr := terrors.Errorf(terrors.InvalidArgument, "Bad Llama")
 	tests := []struct {
 		desc         string
@@ -377,10 +680,8 @@ func TestWrapErrors(t *testing.T) {
 	}
 	ctx := context.Background()
 	for _, test := range tests {
-		i := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-			return test.resp, test.err
-		}
-		resp, err := WrapErrors(i)(ctx, "req", &grpc.UnaryServerInfo{}, nil /* handler */)
+		handler := fakeHandler{resp: test.resp, err: test.err}
+		resp, err := ErrorWrapper(ctx, "req", &grpc.UnaryServerInfo{}, handler.run)
 		if resp != test.resp {
 			t.Errorf("%v: resp = %v, want = %v", test.desc, resp, test.resp)
 		}

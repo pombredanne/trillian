@@ -19,11 +19,17 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+
+	"github.com/golang/glog"
+	"github.com/google/trillian/merkle/hashers"
+	"github.com/google/trillian/storage"
 )
 
 var (
-	// ErrNegativeTreeLevelOffset indicates a negative level was specified.
-	ErrNegativeTreeLevelOffset = errors.New("treeLevelOffset cannot be negative")
+	// ErrSubtreeOverrun indicates that a subtree exceeds the maximum tree depth.
+	ErrSubtreeOverrun = errors.New("subtree with prefix exceeds maximum tree size")
+	smtOne            = big.NewInt(1)
+	smtZero           = big.NewInt(0)
 )
 
 // HStar2LeafHash represents a leaf for the HStar2 sparse Merkle tree
@@ -34,30 +40,26 @@ type HStar2LeafHash struct {
 	LeafHash []byte
 }
 
-// HStar2 is a recursive implementation for calulating the root hash of a sparse
+// HStar2 is a recursive implementation for calculating the root hash of a sparse
 // Merkle tree.
 type HStar2 struct {
-	hasher          TreeHasher
-	hStarEmptyCache [][]byte
+	treeID int64
+	hasher hashers.MapHasher
 }
 
-// NewHStar2 creates a new HStar2 tree calculator based on the passed in
-// TreeHasher.
-func NewHStar2(treeHasher TreeHasher) HStar2 {
+// NewHStar2 creates a new HStar2 tree calculator based on the passed in MapHasher.
+func NewHStar2(treeID int64, hasher hashers.MapHasher) HStar2 {
 	return HStar2{
-		hasher:          treeHasher,
-		hStarEmptyCache: [][]byte{treeHasher.HashLeaf([]byte(""))},
+		treeID: treeID,
+		hasher: hasher,
 	}
 }
 
-// HStar2Root calculates the root of a sparse Merkle tree of depth n which contains
-// the given set of non-null leaves.
-func (s *HStar2) HStar2Root(n int, values []HStar2LeafHash) ([]byte, error) {
-	by(indexLess).Sort(values)
-	offset := big.NewInt(0)
-	return s.hStar2b(n, values, offset,
-		func(depth int, index *big.Int) ([]byte, error) { return s.hStarEmpty(depth) },
-		func(int, *big.Int, []byte) error { return nil })
+// HStar2Root calculates the root of a sparse Merkle tree of a given depth
+// which contains the given set of non-null leaves.
+func (s *HStar2) HStar2Root(depth int, values []HStar2LeafHash) ([]byte, error) {
+	sort.Sort(ByIndex{values})
+	return s.hStar2b(0, depth, values, smtZero, nil, nil)
 }
 
 // SparseGetNodeFunc should return any pre-existing node hash for the node address.
@@ -67,131 +69,104 @@ type SparseGetNodeFunc func(depth int, index *big.Int) ([]byte, error)
 type SparseSetNodeFunc func(depth int, index *big.Int, hash []byte) error
 
 // HStar2Nodes calculates the root hash of a pre-existing sparse Merkle tree
-// plus the extra values passed in.
-// It uses the get and set functions to fetch and store updated internal node
-// values.
+// plus the extra values passed in.  Get and set are used to fetch and store
+// internal node values. Values must not contain multiple leaves for the same
+// index.
 //
-// The treeLevelOffset argument is used when the tree to be calculated is part
-// of a larger tree. It identifes the level in the larger tree at which the
-// root of the subtree being calculated is found.
-// e.g. Imagine a tree 256 levels deep, and that you already (somehow) happen
-// to have the intermediate hash values for the non-null nodes 8 levels below
-// the root already calculated (i.e. you just need to calculate the top 8
-// levels of a 256-level tree).  To do this, you'd set treeDepth=8, and
-// treeLevelOffset=248 (256-8).
-func (s *HStar2) HStar2Nodes(treeDepth, treeLevelOffset int, values []HStar2LeafHash, get SparseGetNodeFunc, set SparseSetNodeFunc) ([]byte, error) {
-	if treeLevelOffset < 0 {
-		return nil, ErrNegativeTreeLevelOffset
+// prefix is the location of this subtree within the larger tree. Root is at nil.
+// subtreeDepth is the number of levels in this subtree.
+func (s *HStar2) HStar2Nodes(prefix []byte, subtreeDepth int, values []HStar2LeafHash,
+	get SparseGetNodeFunc, set SparseSetNodeFunc) ([]byte, error) {
+	if glog.V(3) {
+		glog.Infof("HStar2Nodes(%x, %v, %v)", prefix, subtreeDepth, len(values))
+		for _, v := range values {
+			glog.Infof("  %x: %x", v.Index.Bytes(), v.LeafHash)
+		}
 	}
-	by(indexLess).Sort(values)
-	offset := big.NewInt(0)
-	return s.hStar2b(treeDepth, values, offset,
-		func(depth int, index *big.Int) ([]byte, error) {
-			// if we've got a function for getting existing node values, try it:
-			h, err := get(treeDepth-depth, index)
-			if err != nil {
-				return nil, err
-			}
-			// if we got a value then we'll use that
-			if h != nil {
-				return h, nil
-			}
-			// otherwise just return the null hash for this level
-			return s.hStarEmpty(depth + treeLevelOffset)
-		},
-		func(depth int, index *big.Int, hash []byte) error {
-			return set(treeDepth-depth, index, hash)
-		})
+	depth := len(prefix) * 8
+	totalDepth := depth + subtreeDepth
+	if totalDepth > s.hasher.BitLen() {
+		return nil, ErrSubtreeOverrun
+	}
+	sort.Sort(ByIndex{values})
+	offset := storage.NewNodeIDFromPrefixSuffix(prefix, storage.Suffix{}, s.hasher.BitLen()).BigInt()
+	return s.hStar2b(depth, totalDepth, values, offset, get, set)
 }
 
-// hStarEmpty calculates (and caches) the "null-hash" for the requested tree
-// level.
-func (s *HStar2) hStarEmpty(n int) ([]byte, error) {
-	if len(s.hStarEmptyCache) <= n {
-		emptyRoot, err := s.hStarEmpty(n - 1)
-		if err != nil {
-			return nil, err
-		}
-		h := s.hasher.HashChildren(emptyRoot, emptyRoot)
-		if len(s.hStarEmptyCache) != n {
-			return nil, fmt.Errorf("cache wrong size - expected %d, but cache contains %d entries", n, len(s.hStarEmptyCache))
-		}
-		s.hStarEmptyCache = append(s.hStarEmptyCache, h)
-	}
-	if n >= len(s.hStarEmptyCache) {
-		return nil, fmt.Errorf("cache too small - want level %d, but cache only contains %d entries", n, len(s.hStarEmptyCache))
-	}
-	return s.hStarEmptyCache[n], nil
-}
-
-var (
-	smtOne = big.NewInt(1)
-)
-
-// hStar2b is the recursive implementation for calculating a sparse Merkle tree
-// root value.
-func (s *HStar2) hStar2b(n int, values []HStar2LeafHash, offset *big.Int, get SparseGetNodeFunc, set SparseSetNodeFunc) ([]byte, error) {
-	if n == 0 {
+// hStar2b computes a sparse Merkle tree root value recursively.
+func (s *HStar2) hStar2b(depth, maxDepth int, values []HStar2LeafHash, offset *big.Int,
+	get SparseGetNodeFunc, set SparseSetNodeFunc) ([]byte, error) {
+	if depth == maxDepth {
 		switch {
 		case len(values) == 0:
-			return get(n, offset)
-		case len(values) != 1:
-			return nil, fmt.Errorf("expected 1 value remaining, but found %d", len(values))
+			return s.get(offset, depth, get)
+		case len(values) == 1:
+			return values[0].LeafHash, nil
+		default:
+			return nil, fmt.Errorf("hStar2b base case: len(values): %d, want 1", len(values))
 		}
-		return values[0].LeafHash, nil
 	}
-
-	split := new(big.Int).Lsh(smtOne, uint(n-1))
-	split.Add(split, offset)
 	if len(values) == 0 {
-		return get(n, offset)
+		return s.get(offset, depth, get)
 	}
 
+	bitsLeft := s.hasher.BitLen() - depth
+	split := new(big.Int).Lsh(smtOne, uint(bitsLeft-1))
+	split.Add(split, offset)
 	i := sort.Search(len(values), func(i int) bool { return values[i].Index.Cmp(split) >= 0 })
-	lhs, err := s.hStar2b(n-1, values[:i], offset, get, set)
+	lhs, err := s.hStar2b(depth+1, maxDepth, values[:i], offset, get, set)
 	if err != nil {
 		return nil, err
 	}
-	rhs, err := s.hStar2b(n-1, values[i:], split, get, set)
+	rhs, err := s.hStar2b(depth+1, maxDepth, values[i:], split, get, set)
 	if err != nil {
 		return nil, err
 	}
 	h := s.hasher.HashChildren(lhs, rhs)
-	if set != nil {
-		set(n, offset, h)
-	}
+	s.set(offset, depth, h, set)
 	return h, nil
+}
+
+// get attempts to use getter. If getter fails, returns the HashEmpty value.
+func (s *HStar2) get(index *big.Int, depth int, getter SparseGetNodeFunc) ([]byte, error) {
+	// if we've got a function for getting existing node values, try it:
+	if getter != nil {
+		h, err := getter(depth, index)
+		if err != nil {
+			return nil, err
+		}
+		// if we got a value then we'll use that
+		if h != nil {
+			return h, nil
+		}
+	}
+	// TODO(gdbelvin): Hashers should accept depth as their main argument.
+	height := s.hasher.BitLen() - depth
+	nodeID := storage.NewNodeIDFromBigInt(index.BitLen(), index, s.hasher.BitLen())
+	return s.hasher.HashEmpty(s.treeID, nodeID.Path, height), nil
+}
+
+// set attempts to use setter if it not nil.
+func (s *HStar2) set(index *big.Int, depth int, hash []byte, setter SparseSetNodeFunc) error {
+	if setter != nil {
+		return setter(depth, index, hash)
+	}
+	return nil
 }
 
 // HStar2LeafHash sorting boilerplate below.
 
-type by func(a, b *HStar2LeafHash) bool
+// Leaves is a slice of HStar2LeafHash
+type Leaves []HStar2LeafHash
 
-func (by by) Sort(values []HStar2LeafHash) {
-	s := &valueSorter{
-		values: values,
-		by:     by,
-	}
-	sort.Sort(s)
-}
+// Len returns the number of leaves.
+func (s Leaves) Len() int { return len(s) }
 
-type valueSorter struct {
-	values []HStar2LeafHash
-	by     func(a, b *HStar2LeafHash) bool
-}
+// Swap swaps two leaf locations.
+func (s Leaves) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
-func (s *valueSorter) Len() int {
-	return len(s.values)
-}
+// ByIndex implements sort.Interface by providing Less and using Len and Swap methods from the embedded Leaves value.
+type ByIndex struct{ Leaves }
 
-func (s *valueSorter) Swap(i, j int) {
-	s.values[i], s.values[j] = s.values[j], s.values[i]
-}
-
-func (s *valueSorter) Less(i, j int) bool {
-	return s.by(&s.values[i], &s.values[j])
-}
-
-func indexLess(a, b *HStar2LeafHash) bool {
-	return a.Index.Cmp(b.Index) < 0
-}
+// Less returns true if i.Index < j.Index
+func (s ByIndex) Less(i, j int) bool { return s.Leaves[i].Index.Cmp(s.Leaves[j].Index) < 0 }

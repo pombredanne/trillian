@@ -14,10 +14,18 @@
 
 syntax = "proto3";
 
+option java_multiple_files = true;
+option java_package = "com.google.trillian.proto";
+option java_outer_classname = "TrillianProto";
+option go_package = "github.com/google/trillian";
+
 package trillian;
 
-import "github.com/google/trillian/crypto/sigpb/sigpb.proto";
+import "crypto/keyspb/keyspb.proto";
+import "crypto/sigpb/sigpb.proto";
 import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 
 // What goes in here?
 // Things which are exposed through the public trillian APIs.
@@ -31,7 +39,19 @@ enum HashStrategy {
 
   // Certificate Transparency strategy: leaf hash prefix = 0x00, node prefix =
   // 0x01, empty hash is digest([]byte{}), as defined in the specification.
-  RFC_6962 = 1;
+  RFC6962_SHA256 = 1;
+
+  // Sparse Merkle Tree strategy:  leaf hash prefix = 0x00, node prefix = 0x01,
+  // empty branch is recursively computed from empty leaf nodes. 
+  // NOT secure in a multi tree environment. For testing only.
+  TEST_MAP_HASHER = 2;
+
+  // Append-only log strategy where leaf nodes are defined as the ObjectHash.
+  // All other properties are equal to RFC6962_SHA256.
+  OBJECT_RFC6962_SHA256 = 3;
+
+  // The CONIKS sparse tree hasher with SHA512_256 as the hash algorithm. 
+  CONIKS_SHA512_256 = 4;
 }
 
 // State of the tree.
@@ -47,16 +67,11 @@ enum TreeState {
   // tree is forbidden.
   FROZEN = 2;
 
-  // Tree was been deleted, therefore is invisible and acts similarly to a
-  // non-existing tree for all requests.
-  // A soft deleted tree may be undeleted while the soft-deletion period has not
-  // passed.
-  SOFT_DELETED = 3;
+  // Deprecated in favor of Tree.deleted.
+  DEPRECATED_SOFT_DELETED = 3 [deprecated = true];
 
-  // A hard deleted tree was been definitely deleted and cannot be recovered.
-  // Acts an a non-existing tree for all read and write requests, but blocks the
-  // tree ID from ever being reused.
-  HARD_DELETED = 4;
+  // Deprecated in favor of Tree.deleted.
+  DEPRECATED_HARD_DELETED = 4 [deprecated = true];
 }
 
 // Type of the tree.
@@ -83,8 +98,6 @@ message Tree {
   // State of the tree.
   // Trees are active after creation. At any point the tree may transition
   // between ACTIVE and FROZEN.
-  // Deleted trees are set as SOFT_DELETED for a certain time period, after
-  // which they'll automatically transition to HARD_DELETED.
   TreeState tree_state = 2;
 
   // Type of the tree.
@@ -97,11 +110,16 @@ message Tree {
 
   // Hash algorithm to be used by the tree.
   // Readonly.
+  // TODO(gdbelvin): Deprecate in favor of signature_cipher_suite and hash_strategy.
   sigpb.DigitallySigned.HashAlgorithm hash_algorithm = 5;
 
   // Signature algorithm to be used by the tree.
   // Readonly.
+  // TODO(gdbelvin): Deprecate in favor of signature_cipher_suite.
   sigpb.DigitallySigned.SignatureAlgorithm signature_algorithm = 6;
+
+  // Signature cipher suite specifies the algorithms used to generate signatures.
+  sigpb.DigitallySigned.SignatureCipherSuite signature_cipher_suite = 18;
 
   reserved 7;  // DuplicatePolicy (removed)
 
@@ -113,28 +131,48 @@ message Tree {
   // Optional.
   string description = 9;
 
-  // Timestamp of tree creation.
-  // Readonly.
-  // TODO(codingllama): Migrate public APIs to google.protobuf.Timestamp.
-  int64 create_time_millis_since_epoch = 10;
-
-  // Timestamp of last tree update.
-  // Readonly (automatically assigned on updates).
-  int64 update_time_millis_since_epoch = 11;
+  reserved 10;  // create_time_millis_since_epoch (removed)
+  reserved 11;  // update_time_millis_since_epoch (removed)
 
   // Identifies the private key used for signing tree heads and entry
   // timestamps.
   // This can be any type of message to accommodate different key management
   // systems, e.g. PEM files, HSMs, etc.
   // Private keys are write-only: they're never returned by RPCs.
-  // TODO(RJPercival): Implement sufficient validation to allow this field to be
-  // mutable. It should be mutable in the sense that the key can be migrated to
-  // a different key management system, but the key itself should never change.
+  // The private_key message can be changed after a tree is created, but the
+  // underlying key must remain the same - this is to enable migrating a key
+  // from one provider to another.
   google.protobuf.Any private_key = 12;
 
   // Storage-specific settings.
   // Varies according to the storage implementation backing Trillian.
   google.protobuf.Any storage_settings = 13;
+
+  // The public key used for verifying tree heads and entry timestamps.
+  // Readonly.
+  keyspb.PublicKey public_key = 14;
+
+  // Interval after which a new signed root is produced even if there have been
+  // no submission.  If zero, this behavior is disabled.
+  google.protobuf.Duration max_root_duration = 15;
+
+  // Time of tree creation.
+  // Readonly.
+  google.protobuf.Timestamp create_time = 16;
+
+  // Time of last tree update.
+  // Readonly (automatically assigned on updates).
+  google.protobuf.Timestamp update_time = 17;
+
+  // If true, the tree has been deleted.
+  // Deleted trees may be undeleted during a certain time window, after which
+  // they're permanently deleted (and unrecoverable).
+  // Readonly.
+  bool deleted = 19;
+
+  // Time of tree deletion, if any.
+  // Readonly.
+  google.protobuf.Timestamp delete_time = 20;
 }
 
 message SignedEntryTimestamp {
@@ -148,38 +186,25 @@ message SignedLogRoot {
   // epoch nanoseconds, good until 2500ish
   int64 timestamp_nanos = 1;
   bytes root_hash = 2;
-	// TreeSize is the number of entries in the tree.
+  // TreeSize is the number of entries in the tree.
   int64 tree_size = 3;
-	// TODO(al): define serialized format for the signature scheme.
   sigpb.DigitallySigned signature = 4;
 
   int64 log_id = 5;
   int64 tree_revision = 6;
 }
 
-message MapperMetadata {
-  bytes source_log_id = 1;
-  int64 highest_fully_completed_seq = 2;
-  int64 highest_partially_completed_seq = 3;
- }
-
 // SignedMapRoot represents a commitment by a Map to a particular tree.
 message SignedMapRoot {
   int64 timestamp_nanos = 1;
   bytes root_hash = 2;
-  MapperMetadata metadata = 3;
+  reserved 3;  // was MapperMetadata (removed, replaced by 'Any metadata').
 	// TODO(al): define serialized format for the signature scheme.
   sigpb.DigitallySigned signature = 4;
-
   int64 map_id = 5;
   int64 map_revision = 6;
-}
-
-// PEMKeyFile identifies a private key stored in a PEM-encoded file.
-message PEMKeyFile {
-  // File path of the private key.
-  string path = 1;
-  // Password for decrypting the private key.
-  // If empty, indicates that the private key is not encrypted.
-  string password = 2;
+  // Metadata associated with the Map root.  This is set by the map personality
+  // layer in a SetLeaves map request.  It could be used to persist state
+  // needed to recreate the Map from an external data source.
+  google.protobuf.Any metadata = 7;
 }

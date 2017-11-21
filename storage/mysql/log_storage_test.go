@@ -24,12 +24,15 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/golang/protobuf/proto"
 	"github.com/google/trillian"
-	spb "github.com/google/trillian/crypto/sigpb"
 	"github.com/google/trillian/storage"
+	"github.com/google/trillian/storage/testonly"
 	"github.com/kylelemons/godebug/pretty"
+
+	spb "github.com/google/trillian/crypto/sigpb"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 var allTables = []string{"Unsequenced", "TreeHead", "SequencedLeafData", "LeafData", "Subtree", "TreeControl", "Trees", "MapLeaf", "MapHead"}
@@ -96,7 +99,7 @@ func checkLeafContents(leaf *trillian.LogLeaf, seq int64, rawHash, hash, data, e
 
 func TestMySQLLogStorage_CheckDatabaseAccessible(t *testing.T) {
 	cleanTestDB(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 	if err := s.CheckDatabaseAccessible(context.Background()); err != nil {
 		t.Errorf("CheckDatabaseAccessible() = %v, want = nil", err)
 	}
@@ -165,7 +168,7 @@ func TestBeginSnapshot(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 	for _, test := range tests {
 		func() {
 			var tx rootReaderLogTX
@@ -210,7 +213,7 @@ type rootReaderLogTX interface {
 func TestIsOpenCommitRollbackClosed(t *testing.T) {
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tests := []struct {
 		commit, rollback, close bool
@@ -251,7 +254,7 @@ func TestQueueDuplicateLeaf(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 	count := 15
 	leaves := createTestLeaves(int64(count), 10)
 	leaves2 := createTestLeaves(int64(count), 12)
@@ -285,7 +288,8 @@ func TestQueueDuplicateLeaf(t *testing.T) {
 			defer tx.Close()
 			existing, err := tx.QueueLeaves(ctx, test.leaves, fakeQueueTime)
 			if err != nil {
-				t.Fatalf("Failed to queue leaves: %v", err)
+				t.Errorf("Failed to queue leaves: %v", err)
+				return
 			}
 			commit(tx, t)
 
@@ -303,7 +307,7 @@ func TestQueueDuplicateLeaf(t *testing.T) {
 				}
 				if got == nil {
 					t.Errorf("QueueLeaves()[%d]=nil; want non-nil", i)
-				} else if bytes.Compare(got.LeafIdentityHash, want.LeafIdentityHash) != 0 {
+				} else if !bytes.Equal(got.LeafIdentityHash, want.LeafIdentityHash) {
 					t.Errorf("QueueLeaves()[%d].LeafIdentityHash=%x; want %x", i, got.LeafIdentityHash, want.LeafIdentityHash)
 				}
 			}
@@ -316,7 +320,7 @@ func TestQueueLeaves(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tx := beginLogTx(s, logID, t)
 	defer tx.Close()
@@ -351,7 +355,7 @@ func TestDequeueLeavesNoneQueued(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tx := beginLogTx(s, logID, t)
 	defer tx.Close()
@@ -371,7 +375,7 @@ func TestDequeueLeaves(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	{
 		tx := beginLogTx(s, logID, t)
@@ -418,7 +422,7 @@ func TestDequeueLeavesTwoBatches(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	leavesToDequeue1 := 3
 	leavesToDequeue2 := 2
@@ -488,7 +492,7 @@ func TestDequeueLeavesGuardInterval(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	{
 		tx := beginLogTx(s, logID, t)
@@ -533,7 +537,7 @@ func TestDequeueLeavesTimeOrdering(t *testing.T) {
 	// queue.
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	batchSize := 2
 	leaves := createTestLeaves(int64(batchSize), 0)
@@ -597,7 +601,7 @@ func TestGetLeavesByHashNotPresent(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tx := beginLogTx(s, logID, t)
 	defer tx.Close()
@@ -618,7 +622,7 @@ func TestGetLeavesByIndexNotPresent(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tx := beginLogTx(s, logID, t)
 	defer tx.Close()
@@ -635,7 +639,7 @@ func TestGetLeavesByHash(t *testing.T) {
 	// Create fake leaf as if it had been sequenced
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	data := []byte("some data")
 	createFakeLeaf(ctx, DB, logID, dummyRawHash, dummyHash, data, someExtraData, sequenceNumber, t)
@@ -661,7 +665,7 @@ func TestGetLeafDataByIdentityHash(t *testing.T) {
 	// Create fake leaf as if it had been sequenced
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 	data := []byte("some data")
 	leaf := createFakeLeaf(ctx, DB, logID, dummyRawHash, dummyHash, data, someExtraData, sequenceNumber, t)
 	leaf.LeafIndex = -1
@@ -723,7 +727,7 @@ func TestGetLeavesByIndex(t *testing.T) {
 	// Create fake leaf as if it had been sequenced, read it back and check contents
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	data := []byte("some data")
 	createFakeLeaf(ctx, DB, logID, dummyRawHash, dummyHash, data, someExtraData, sequenceNumber, t)
@@ -747,7 +751,7 @@ func TestLatestSignedRootNoneWritten(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tx := beginLogTx(s, logID, t)
 	defer tx.Close()
@@ -767,7 +771,7 @@ func TestLatestSignedLogRoot(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tx := beginLogTx(s, logID, t)
 	defer tx.Close()
@@ -804,7 +808,7 @@ func TestDuplicateSignedLogRoot(t *testing.T) {
 
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tx := beginLogTx(s, logID, t)
 	defer tx.Close()
@@ -833,7 +837,7 @@ func TestLogRootUpdate(t *testing.T) {
 	// Write two roots for a log and make sure the one with the newest timestamp supersedes
 	cleanTestDB(DB)
 	logID := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tx := beginLogTx(s, logID, t)
 	defer tx.Close()
@@ -873,119 +877,68 @@ func TestLogRootUpdate(t *testing.T) {
 	commit(tx2, t)
 }
 
-// getActiveLogIDsFn creates a TX, calls the appropriate GetActiveLogIDs* function, commits the TX
-// and returns the results.
-type getActiveLogIDsFn func(context.Context, storage.LogStorage, int64) ([]int64, error)
-
-type getActiveIDsTest struct {
-	name string
-	fn   getActiveLogIDsFn
-}
-
-func toIDsMap(ids []int64) map[int64]bool {
-	idsMap := make(map[int64]bool)
-	for _, logID := range ids {
-		idsMap[logID] = true
-	}
-	return idsMap
-}
-
-// runTestGetActiveLogIDsInternal calls test.fn (which is either GetActiveLogIDs or
-// GetActiveLogIDsWithPendingWork) and check that the result matches wantIds.
-func runTestGetActiveLogIDsInternal(ctx context.Context, t *testing.T, test getActiveIDsTest, logID int64, wantIds []int64) {
-	s := NewLogStorage(DB)
-
-	logIDs, err := test.fn(ctx, s, logID)
-	if err != nil {
-		t.Errorf("%v = (_, %v), want = (_, nil)", test.name, err)
-		return
-	}
-
-	if got, want := len(logIDs), len(wantIds); got != want {
-		t.Errorf("%v: got %d IDs, want = %v", test.name, got, want)
-		return
-	}
-	got, want := toIDsMap(logIDs), toIDsMap(wantIds)
-	if diff := pretty.Compare(got, want); diff != "" {
-		t.Errorf("%v: post-Get diff:\n%v", test.name, diff)
-	}
-}
-
-func runTestGetActiveLogIDs(ctx context.Context, t *testing.T, test getActiveIDsTest) {
-	cleanTestDB(DB)
-	logID1 := createLogForTests(DB)
-	logID2 := createLogForTests(DB)
-	logID3 := createLogForTests(DB)
-	wantIds := []int64{logID1, logID2, logID3}
-	runTestGetActiveLogIDsInternal(ctx, t, test, logID1, wantIds)
-}
-
-func runTestGetActiveLogIDsWithPendingWork(ctx context.Context, t *testing.T, test getActiveIDsTest) {
-	cleanTestDB(DB)
-	logID1 := createLogForTests(DB)
-	logID2 := createLogForTests(DB)
-	logID3 := createLogForTests(DB)
-	s := NewLogStorage(DB)
-
-	// Do a first run without any pending logs
-	runTestGetActiveLogIDsInternal(ctx, t, test, logID1, nil)
-
-	for _, logID := range []int64{logID1, logID2, logID3} {
-		func() {
-			tx := beginLogTx(s, logID, t)
-			defer tx.Close()
-			leaves := createTestLeaves(leavesToInsert, 2)
-			if _, err := tx.QueueLeaves(ctx, leaves, fakeQueueTime); err != nil {
-				t.Fatalf("Failed to queue leaves for log %v: %v", logID, err)
-			}
-			commit(tx, t)
-		}()
-	}
-
-	wantIds := []int64{logID1, logID2, logID3}
-	runTestGetActiveLogIDsInternal(ctx, t, test, logID1, wantIds)
-}
-
 func TestGetActiveLogIDs(t *testing.T) {
-	getActiveIDsBegin := func(ctx context.Context, s storage.LogStorage, logID int64) ([]int64, error) {
-		tx, err := s.BeginForTree(ctx, logID)
-		if err != nil {
-			return nil, err
-		}
-		defer tx.Close()
-		ids, err := tx.GetActiveLogIDs(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return ids, nil
-	}
-	getActiveIDsSnapshot := func(ctx context.Context, s storage.LogStorage, logID int64) ([]int64, error) {
-		tx, err := s.Snapshot(ctx)
-		if err != nil {
-			return nil, err
-		}
-		defer tx.Close()
-		ids, err := tx.GetActiveLogIDs(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return ids, nil
-	}
-
-	tests := []getActiveIDsTest{
-		{name: "getActiveIDsBegin", fn: getActiveIDsBegin},
-		{name: "getActiveIDsSnapshot", fn: getActiveIDsSnapshot},
-	}
-
 	ctx := context.Background()
-	for _, test := range tests {
-		runTestGetActiveLogIDs(ctx, t, test)
+
+	cleanTestDB(DB)
+	admin := NewAdminStorage(DB)
+
+	// Create a few test trees
+	log1 := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	log2 := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	frozenLog := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	deletedLog := proto.Clone(testonly.LogTree).(*trillian.Tree)
+	map1 := proto.Clone(testonly.MapTree).(*trillian.Tree)
+	map2 := proto.Clone(testonly.MapTree).(*trillian.Tree)
+	deletedMap := proto.Clone(testonly.MapTree).(*trillian.Tree)
+	for _, tree := range []*trillian.Tree{log1, log2, frozenLog, deletedLog, map1, map2, deletedMap} {
+		newTree, err := createTreeInternal(ctx, admin, tree)
+		if err != nil {
+			t.Fatalf("createTreeInternal(%+v) returned err = %v", tree, err)
+		}
+		*tree = *newTree
+	}
+
+	// FROZEN is not a valid initial state, so we have to update it separately.
+	var err error
+	_, err = updateTreeInternal(ctx, admin, frozenLog.TreeId, func(t *trillian.Tree) {
+		t.TreeState = trillian.TreeState_FROZEN
+	})
+	if err != nil {
+		t.Fatalf("updateTreeInternal() returned err = %v", err)
+	}
+
+	// Update deleted trees accordingly
+	updateDeletedStmt, err := DB.PrepareContext(ctx, "UPDATE Trees SET Deleted = ? WHERE TreeId = ?")
+	if err != nil {
+		t.Fatalf("PrepareContext() returned err = %v", err)
+	}
+	defer updateDeletedStmt.Close()
+	for _, treeID := range []int64{deletedLog.TreeId, deletedMap.TreeId} {
+		if _, err := updateDeletedStmt.ExecContext(ctx, true, treeID); err != nil {
+			t.Fatalf("ExecContext(%v) returned err = %v", treeID, err)
+		}
+	}
+
+	s := NewLogStorage(DB, nil)
+	tx, err := s.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot() returns err = %v", err)
+	}
+	defer tx.Close()
+	got, err := tx.GetActiveLogIDs(ctx)
+	if err != nil {
+		t.Fatalf("GetActiveLogIDs() returns err = %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Errorf("Commit() returned err = %v", err)
+	}
+
+	want := []int64{log1.TreeId, log2.TreeId}
+	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
+	if diff := pretty.Compare(got, want); diff != "" {
+		t.Errorf("post-GetActiveLogIDs diff (-got +want):\n%v", diff)
 	}
 }
 
@@ -993,73 +946,81 @@ func TestGetActiveLogIDsEmpty(t *testing.T) {
 	ctx := context.Background()
 
 	cleanTestDB(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	tx, err := s.Snapshot(context.Background())
 	if err != nil {
 		t.Fatalf("Snapshot() = (_, %v), want = (_, nil)", err)
 	}
 	defer tx.Close()
-
-	activeIDs, err := tx.GetActiveLogIDs(ctx)
+	ids, err := tx.GetActiveLogIDs(ctx)
 	if err != nil {
 		t.Fatalf("GetActiveLogIDs() = (_, %v), want = (_, nil)", err)
 	}
-	if got, want := len(activeIDs), 0; got != want {
-		t.Errorf("GetActiveLogIDs(): got %v IDs, want = %v", got, want)
+	if err := tx.Commit(); err != nil {
+		t.Errorf("Commit() = %v, want = nil", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("Commit() = %v, want = nil", err)
+	if got, want := len(ids), 0; got != want {
+		t.Errorf("GetActiveLogIDs(): got %v IDs, want = %v", got, want)
 	}
 }
 
-func TestGetActiveLogIDsWithPendingWork(t *testing.T) {
-	getActiveIDsBegin := func(ctx context.Context, s storage.LogStorage, logID int64) ([]int64, error) {
-		tx, err := s.BeginForTree(ctx, logID)
-		if err != nil {
-			return nil, err
-		}
-		defer tx.Close()
-		ids, err := tx.GetActiveLogIDsWithPendingWork(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return ids, nil
+func TestGetUnsequencedCounts(t *testing.T) {
+	numLogs := 4
+	cleanTestDB(DB)
+	logIDs := make([]int64, 0, numLogs)
+	for i := 0; i < numLogs; i++ {
+		logIDs = append(logIDs, createLogForTests(DB))
 	}
-	getActiveIDsSnapshot := func(ctx context.Context, s storage.LogStorage, logID int64) ([]int64, error) {
+	s := NewLogStorage(DB, nil)
+
+	ctx := context.Background()
+	expectedCount := make(map[int64]int64)
+
+	for i := int64(1); i < 10; i++ {
+		// Put some leaves in the queue of each of the logs
+		for j, logID := range logIDs {
+			tx := beginLogTx(s, logID, t)
+			// tx explicitly closed in all branches
+
+			numToAdd := i + int64(j)
+			leaves := createTestLeaves(numToAdd, expectedCount[logID])
+			if _, err := tx.QueueLeaves(ctx, leaves, fakeDequeueCutoffTime); err != nil {
+				tx.Close()
+				t.Fatalf("Failed to queue leaves: %v", err)
+			}
+
+			commit(tx, t)
+			expectedCount[logID] += numToAdd
+		}
+
+		// Now check what we get back from GetUnsequencedCounts matches
 		tx, err := s.Snapshot(ctx)
 		if err != nil {
-			return nil, err
+			t.Fatalf("Snapshot() = (_, %v), want no error", err)
 		}
-		defer tx.Close()
-		ids, err := tx.GetActiveLogIDsWithPendingWork(ctx)
+		// tx explicitly closed in all branches
+
+		got, err := tx.GetUnsequencedCounts(ctx)
 		if err != nil {
-			return nil, err
+			tx.Close()
+			t.Errorf("GetUnsequencedCounts() = %v, want no error", err)
 		}
 		if err := tx.Commit(); err != nil {
-			return nil, err
+			t.Errorf("Commit() = %v, want no error", err)
+			return
 		}
-		return ids, nil
-	}
-
-	tests := []getActiveIDsTest{
-		{name: "getActiveIDsBegin", fn: getActiveIDsBegin},
-		{name: "getActiveIDsSnapshot", fn: getActiveIDsSnapshot},
-	}
-	ctx := context.Background()
-	for _, test := range tests {
-		runTestGetActiveLogIDsWithPendingWork(ctx, t, test)
+		if diff := pretty.Compare(expectedCount, got); diff != "" {
+			t.Errorf("GetUnsequencedCounts() = diff -want +got:\n%s", diff)
+		}
 	}
 }
 
 func TestReadOnlyLogTX_Rollback(t *testing.T) {
 	ctx := context.Background()
 	cleanTestDB(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 	tx, err := s.Snapshot(ctx)
 	if err != nil {
 		t.Fatalf("Snapshot() = (_, %v), want = (_, nil)", err)
@@ -1081,7 +1042,7 @@ func TestGetSequencedLeafCount(t *testing.T) {
 	cleanTestDB(DB)
 	logID1 := createLogForTests(DB)
 	logID2 := createLogForTests(DB)
-	s := NewLogStorage(DB)
+	s := NewLogStorage(DB, nil)
 
 	{
 		// Create fake leaf as if it had been sequenced
@@ -1205,4 +1166,14 @@ func leafInBatch(leaf *trillian.LogLeaf, batch []*trillian.LogLeaf) bool {
 	}
 
 	return false
+}
+
+// byLeafIdentityHash allows sorting of leaves by their identity hash, so DB
+// operations always happen in a consistent order.
+type byLeafIdentityHash []*trillian.LogLeaf
+
+func (l byLeafIdentityHash) Len() int      { return len(l) }
+func (l byLeafIdentityHash) Swap(i, j int) { l[i], l[j] = l[j], l[i] }
+func (l byLeafIdentityHash) Less(i, j int) bool {
+	return bytes.Compare(l[i].LeafIdentityHash, l[j].LeafIdentityHash) == -1
 }

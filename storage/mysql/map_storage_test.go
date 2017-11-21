@@ -16,15 +16,27 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes/any"
 	"github.com/google/trillian"
-	spb "github.com/google/trillian/crypto/sigpb"
+	"github.com/google/trillian/crypto/sigpb"
+	"github.com/google/trillian/examples/ct/ctmapper/ctmapperpb"
 	"github.com/google/trillian/storage"
+	"github.com/google/trillian/storage/testdb"
+	"github.com/google/trillian/testonly"
+	"github.com/kylelemons/godebug/pretty"
+
+	spb "github.com/google/trillian/crypto/sigpb"
 )
 
 func TestMySQLMapStorage_CheckDatabaseAccessible(t *testing.T) {
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
 	cleanTestDB(DB)
 	s := NewMapStorage(DB)
 	if err := s.CheckDatabaseAccessible(context.Background()); err != nil {
@@ -33,14 +45,19 @@ func TestMySQLMapStorage_CheckDatabaseAccessible(t *testing.T) {
 }
 
 func TestMapBeginSnapshot(t *testing.T) {
-	cleanTestDB(DB)
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
 
-	frozenMapID := createMapForTests(DB)
+	cleanTestDB(DB)
+	ctx := context.Background()
+
+	frozenMapID := createInitializedMapForTests(ctx, t, DB)
 	updateTree(DB, frozenMapID, func(tree *trillian.Tree) {
 		tree.TreeState = trillian.TreeState_FROZEN
 	})
 
-	activeMapID := createMapForTests(DB)
+	activeMapID := createInitializedMapForTests(ctx, t, DB)
 	logID := createLogForTests(DB)
 
 	tests := []struct {
@@ -92,10 +109,9 @@ func TestMapBeginSnapshot(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
 	s := NewMapStorage(DB)
 	for _, test := range tests {
-		func() {
+		t.Run(test.desc, func(t *testing.T) {
 			var tx rootReaderMapTX
 			var err error
 			if test.snapshot {
@@ -126,7 +142,7 @@ func TestMapBeginSnapshot(t *testing.T) {
 					t.Errorf("%v: WriteRevision() = %v, want = %v", test.desc, got, want)
 				}
 			}
-		}()
+		})
 	}
 }
 
@@ -136,49 +152,93 @@ type rootReaderMapTX interface {
 }
 
 func TestMapRootUpdate(t *testing.T) {
-	// Write two roots for a map and make sure the one with the newest timestamp supersedes
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	mapID := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
-	tx := beginMapTx(ctx, s, mapID, t)
-	defer tx.Close()
+	populatedMetadata := testonly.MustMarshalAny(t, &ctmapperpb.MapperMetadata{HighestFullyCompletedSeq: 1})
 
-	root := trillian.SignedMapRoot{
-		MapId:          mapID,
-		TimestampNanos: 98765,
-		MapRevision:    5,
-		RootHash:       []byte(dummyHash),
-		Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
-	}
-	if err := tx.StoreSignedMapRoot(ctx, root); err != nil {
-		t.Fatalf("Failed to store signed map root: %v", err)
-	}
-	root2 := trillian.SignedMapRoot{
-		MapId:          mapID,
-		TimestampNanos: 98766,
-		MapRevision:    6,
-		RootHash:       []byte(dummyHash),
-		Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
-	}
-	if err := tx.StoreSignedMapRoot(ctx, root2); err != nil {
-		t.Fatalf("Failed to store signed map root: %v", err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("Failed to commit new map roots: %v", err)
-	}
+	for _, tc := range []struct {
+		desc         string
+		root         trillian.SignedMapRoot
+		wantMetadata *any.Any
+	}{
+		{
+			desc: "Initial root",
+			root: trillian.SignedMapRoot{
+				MapId:          mapID,
+				TimestampNanos: 98765,
+				MapRevision:    5,
+				RootHash:       []byte(dummyHash),
+				Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
+			},
+		},
+		{
+			desc: "Root update",
+			root: trillian.SignedMapRoot{
+				MapId:          mapID,
+				TimestampNanos: 98766,
+				MapRevision:    6,
+				RootHash:       []byte(dummyHash),
+				Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
+			},
+		},
+		{
+			desc: "Root with default (empty) MapperMetadata",
+			root: trillian.SignedMapRoot{
+				MapId:          mapID,
+				TimestampNanos: 98768,
+				MapRevision:    7,
+				RootHash:       []byte(dummyHash),
+				Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
+				Metadata:       &any.Any{},
+			},
+		},
+		{
+			desc: "Root with non-default (populated) MapperMetadata",
+			root: trillian.SignedMapRoot{
+				MapId:          mapID,
+				TimestampNanos: 98769,
+				MapRevision:    8,
+				RootHash:       []byte(dummyHash),
+				Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
+				Metadata:       populatedMetadata,
+			},
+			wantMetadata: populatedMetadata,
+		},
+	} {
+		func() {
+			tx := beginMapTx(ctx, s, mapID, t)
+			defer tx.Close()
+			if err := tx.StoreSignedMapRoot(ctx, tc.root); err != nil {
+				t.Fatalf("%v: Failed to store signed map root: %v", tc.desc, err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("%v: Failed to commit new map roots: %v", tc.desc, err)
+			}
+		}()
 
-	tx = beginMapTx(ctx, s, mapID, t)
-	defer tx.Close()
-	root3, err := tx.LatestSignedMapRoot(ctx)
-	if err != nil {
-		t.Fatalf("Failed to read back new map root: %v", err)
+		func() {
+			tx := beginMapTx(ctx, s, mapID, t)
+			defer tx.Close()
+			root, err := tx.LatestSignedMapRoot(ctx)
+			if err != nil {
+				t.Fatalf("%v: Failed to read back new map root: %v", tc.desc, err)
+			}
+
+			want := proto.Clone(&tc.root).(*trillian.SignedMapRoot)
+			want.Metadata = tc.wantMetadata
+			if got := &root; !proto.Equal(got, want) {
+				t.Errorf("%v: LatestSignedMapRoot() diff(-got, +want) \n%v", tc.desc, pretty.Compare(got, want))
+			}
+			commit(tx, t)
+		}()
 	}
-	if !proto.Equal(&root2, &root3) {
-		t.Fatalf("Root round trip failed: <%v> and: <%v>", root, root2)
-	}
-	commit(tx, t)
 }
 
 var keyHash = []byte([]byte("A Key Hash"))
@@ -190,12 +250,16 @@ var mapLeaf = trillian.MapLeaf{
 }
 
 func TestMapSetGetRoundTrip(t *testing.T) {
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	mapID := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
 	readRev := int64(1)
-	ctx := context.Background()
 	{
 		tx := beginMapTx(ctx, s, mapID, t)
 		defer tx.Close()
@@ -225,11 +289,14 @@ func TestMapSetGetRoundTrip(t *testing.T) {
 }
 
 func TestMapSetSameKeyInSameRevisionFails(t *testing.T) {
-	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
-	s := NewMapStorage(DB)
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
 
+	cleanTestDB(DB)
 	ctx := context.Background()
+	mapID := createInitializedMapForTests(ctx, t, DB)
+	s := NewMapStorage(DB)
 
 	{
 		tx := beginMapTx(ctx, s, mapID, t)
@@ -252,28 +319,45 @@ func TestMapSetSameKeyInSameRevisionFails(t *testing.T) {
 	}
 }
 
-func TestMapGetUnknownKey(t *testing.T) {
+func TestMapGet0Results(t *testing.T) {
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	mapID := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
-	tx := beginMapTx(ctx, s, mapID, t)
-	defer tx.Close()
-	readValues, err := tx.Get(ctx, 1, [][]byte{[]byte("This doesn't exist.")})
-	if err != nil {
-		t.Fatalf("Read returned error %v", err)
+	for _, tc := range []struct {
+		index [][]byte
+	}{
+		{index: nil}, //empty list.
+		{index: [][]byte{[]byte("This doesn't exist.")}},
+	} {
+		tx := beginMapTx(ctx, s, mapID, t)
+		defer tx.Close()
+		defer commit(tx, t)
+		readValues, err := tx.Get(ctx, 1, tc.index)
+		if err != nil {
+			t.Errorf("tx.Get(%s): %v", tc.index, err)
+			continue
+		}
+		if got, want := len(readValues), 0; got != want {
+			t.Errorf("len(tx.Get(%s)): %d, want %d", tc.index, got, want)
+		}
 	}
-	if got, want := len(readValues), 0; got != want {
-		t.Fatalf("Unexpectedly read %d values, expected %d", got, want)
-	}
-	commit(tx, t)
 }
 
 func TestMapSetGetMultipleRevisions(t *testing.T) {
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
 	// Write two roots for a map and make sure the one with the newest timestamp supersedes
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	mapID := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
 	tests := []struct {
@@ -286,7 +370,6 @@ func TestMapSetGetMultipleRevisions(t *testing.T) {
 		{3, trillian.MapLeaf{Index: keyHash, LeafHash: []byte{3}, LeafValue: []byte{3}, ExtraData: []byte{3}}},
 	}
 
-	ctx := context.Background()
 	for _, tc := range tests {
 		func() {
 			// Write the current test case.
@@ -331,12 +414,34 @@ func TestMapSetGetMultipleRevisions(t *testing.T) {
 	}
 }
 
-func TestLatestSignedMapRootNoneWritten(t *testing.T) {
+func TestGetSignedMapRootNotExist(t *testing.T) {
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	mapID := createMapForTests(DB) // Uninitialized: no revision 0 MapRoot exists.
 	s := NewMapStorage(DB)
 
 	ctx := context.Background()
+	_, err := s.BeginForTree(ctx, mapID)
+	if got, want := err, storage.ErrMapNeedsInit; got != want {
+		t.Fatalf("GetSignedMapRoot: %v, want %v", got, want)
+	}
+}
+
+func TestLatestSignedMapRootNoneWritten(t *testing.T) {
+	// TODO(phad): I'm considering removing this test, because for an Map that has been
+	// initialized there should always be the revision 0 SMR written to the DB, and
+	// without initialization the error path is identical to that tested in the func
+	// TestGetSignedMapRootNotExist above.
+	t.Skip("TODO: remove this as it can no longer occur.")
+
+	cleanTestDB(DB)
+	ctx := context.Background()
+	mapID := createInitializedMapForTests(ctx, t, DB)
+	s := NewMapStorage(DB)
+
 	tx := beginMapTx(ctx, s, mapID, t)
 	defer tx.Close()
 
@@ -350,12 +455,58 @@ func TestLatestSignedMapRootNoneWritten(t *testing.T) {
 	commit(tx, t)
 }
 
-func TestLatestSignedMapRoot(t *testing.T) {
+func TestGetSignedMapRoot(t *testing.T) {
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	mapID := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
+	tx := beginMapTx(ctx, s, mapID, t)
+	defer tx.Close()
+
+	revision := int64(5)
+	root := trillian.SignedMapRoot{
+		MapId:          mapID,
+		TimestampNanos: 98765,
+		MapRevision:    revision,
+		RootHash:       []byte(dummyHash),
+		Signature:      &spb.DigitallySigned{Signature: []byte("notempty")},
+	}
+	if err := tx.StoreSignedMapRoot(ctx, root); err != nil {
+		t.Fatalf("Failed to store signed root: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Failed to commit new map root: %v", err)
+	}
+
+	{
+		tx2 := beginMapTx(ctx, s, mapID, t)
+		defer tx2.Close()
+		root2, err := tx2.GetSignedMapRoot(ctx, revision)
+		if err != nil {
+			t.Fatalf("Failed to get back new map root: %v", err)
+		}
+		if !proto.Equal(&root, &root2) {
+			t.Fatalf("Getting root round trip failed: <%#v> and: <%#v>", root, root2)
+		}
+		commit(tx2, t)
+	}
+}
+
+func TestLatestSignedMapRoot(t *testing.T) {
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
+	cleanTestDB(DB)
 	ctx := context.Background()
+	mapID := createInitializedMapForTests(ctx, t, DB)
+	s := NewMapStorage(DB)
+
 	tx := beginMapTx(ctx, s, mapID, t)
 	defer tx.Close()
 
@@ -388,11 +539,15 @@ func TestLatestSignedMapRoot(t *testing.T) {
 }
 
 func TestDuplicateSignedMapRoot(t *testing.T) {
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
 	cleanTestDB(DB)
-	mapID := createMapForTests(DB)
+	ctx := context.Background()
+	mapID := createInitializedMapForTests(ctx, t, DB)
 	s := NewMapStorage(DB)
 
-	ctx := context.Background()
 	tx := beginMapTx(ctx, s, mapID, t)
 	defer tx.Close()
 
@@ -414,6 +569,10 @@ func TestDuplicateSignedMapRoot(t *testing.T) {
 }
 
 func TestReadOnlyMapTX_Rollback(t *testing.T) {
+	if provider := testdb.Default(); !provider.IsMySQL() {
+		t.Skipf("Inhibited due to known issue (#896) on SQL driver: %q", provider.Driver)
+	}
+
 	cleanTestDB(DB)
 	s := NewMapStorage(DB)
 	tx, err := s.Snapshot(context.Background())
@@ -433,4 +592,35 @@ func beginMapTx(ctx context.Context, s storage.MapStorage, mapID int64, t *testi
 		t.Fatalf("Failed to begin map tx: %v", err)
 	}
 	return tx
+}
+
+func createInitializedMapForTests(ctx context.Context, t *testing.T, db *sql.DB) int64 {
+	t.Helper()
+	mapID := createMapForTests(db)
+
+	s := NewMapStorage(db)
+	tx, err := s.BeginForTree(ctx, mapID)
+	if err != storage.ErrMapNeedsInit {
+		t.Fatalf("%v: Failed to BeginForTree: %v", mapID, err)
+	}
+	defer tx.Close()
+
+	initialRoot := trillian.SignedMapRoot{
+		RootHash: []byte("rootHash"),
+		Signature: &sigpb.DigitallySigned{
+			Signature: []byte("sig"),
+		},
+		MapId:       mapID,
+		MapRevision: 0,
+	}
+
+	if err = tx.StoreSignedMapRoot(ctx, initialRoot); err != nil {
+		t.Fatalf("%v: Failed to StoreSignedMapRoot: %v", mapID, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("%v: Commit failed for map: %v", mapID, err)
+	}
+
+	return mapID
 }

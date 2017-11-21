@@ -15,44 +15,24 @@
 package crypto
 
 import (
-	"crypto"
 	"errors"
 	"testing"
 
 	"github.com/golang/mock/gomock"
 	"github.com/google/trillian"
-	"github.com/google/trillian/crypto/keys"
+	"github.com/google/trillian/crypto/keys/pem"
 	"github.com/google/trillian/crypto/sigpb"
 	"github.com/google/trillian/testonly"
 )
 
 const message string = "testing"
 
-type usesSHA256Hasher struct{}
-
-func (i usesSHA256Hasher) Matches(x interface{}) bool {
-	h, ok := x.(crypto.SignerOpts)
-	if !ok {
-		return false
-	}
-	return h.HashFunc() == crypto.SHA256
-}
-
-func (i usesSHA256Hasher) String() string {
-	return "uses SHA256 hasher"
-}
-
 func TestSigner(t *testing.T) {
-	key, err := keys.NewFromPrivatePEM(testonly.DemoPrivateKey, testonly.DemoPrivateKeyPass)
+	key, err := pem.UnmarshalPrivateKey(testonly.DemoPrivateKey, testonly.DemoPrivateKeyPass)
 	if err != nil {
 		t.Fatalf("Failed to open test key, err=%v", err)
 	}
 	signer := NewSHA256Signer(key)
-
-	pk, err := keys.NewFromPublicPEM(testonly.DemoPublicKey)
-	if err != nil {
-		t.Fatalf("Failed to load public key, err=%v", err)
-	}
 
 	for _, test := range []struct {
 		message []byte
@@ -73,7 +53,7 @@ func TestSigner(t *testing.T) {
 			t.Errorf("Sig alg incorrect, got %v expected %v", got, want)
 		}
 		// Check that the signature is correct
-		if err := Verify(pk, test.message, sig); err != nil {
+		if err := Verify(key.Public(), test.message, sig); err != nil {
 			t.Errorf("Verify(%v) failed: %v", test.message, err)
 		}
 	}
@@ -83,7 +63,7 @@ func TestSignerFails(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	key, err := keys.NewFromPrivatePEM(testonly.DemoPrivateKey, testonly.DemoPrivateKeyPass)
+	key, err := pem.UnmarshalPrivateKey(testonly.DemoPrivateKey, testonly.DemoPrivateKeyPass)
 	if err != nil {
 		t.Fatalf("Failed to load private key: %v", err)
 	}
@@ -100,14 +80,17 @@ func TestSignLogRootSignerFails(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	key, err := keys.NewFromPrivatePEM(testonly.DemoPrivateKey, testonly.DemoPrivateKeyPass)
+	key, err := pem.UnmarshalPrivateKey(testonly.DemoPrivateKey, testonly.DemoPrivateKeyPass)
 	if err != nil {
 		t.Fatalf("Failed to load public key: %v", err)
 	}
 
 	s := testonly.NewSignerWithErr(key, errors.New("signfail"))
 	root := trillian.SignedLogRoot{TimestampNanos: 2267709, RootHash: []byte("Islington"), TreeSize: 2}
-	_, err = NewSHA256Signer(s).Sign(HashLogRoot(root))
-
+	hash, err := HashLogRoot(root)
+	if err != nil {
+		t.Fatalf("HashLogRoot(): %v", err)
+	}
+	_, err = NewSHA256Signer(s).Sign(hash)
 	testonly.EnsureErrorContains(t, err, "signfail")
 }

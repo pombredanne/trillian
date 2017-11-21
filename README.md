@@ -58,13 +58,16 @@ Using the Code
 suitable for production use.  Everything here is subject to change without
 notice &ndash; including APIs, database schemas, and code layout.
 
-To build and run the Trillian code you need:
+To build and test Trillian you need:
 
- - Go 1.8 or later.
+ - Go 1.9 or later.
+
+To run integration tests (and production deployment) you need:
+
  - [MySQL](https://www.mysql.com/) or [MariaDB](https://mariadb.org/) to provide
    the data storage layer; see the [MySQL Setup](#mysql-setup) section.
 
-Then use the standard Go tools to install other dependencies.
+Use the standard Go tools to install other dependencies.
 
 ```bash
 go get github.com/google/trillian
@@ -75,7 +78,7 @@ go get -t -u -v ./...
 To build and run tests, use:
 
 ```bash
-./scripts/presubmit.sh --no-generate --no-linters
+go test ./...
 ```
 
 The repository also includes multi-process integration tests, described in the
@@ -83,25 +86,27 @@ The repository also includes multi-process integration tests, described in the
 
 ### MySQL Setup
 
-To run Trillian, including for any of the tests, you need to have an instance
-of MySQL running and configured
+To run Trillian's integration tests you need to have an instance of MySQL
+running and configured to:
 
- - to listen on the standard MySQL port 3306 (so `mysql --host=127.0.0.1
+ - listen on the standard MySQL port 3306 (so `mysql --host=127.0.0.1
    --port=3306` connects OK)
- - not to require a password for the `root` user
+ - not require a password for the `root` user
 
-You can then set up the [expected tables](storage/mysql/storage.sql) in a
-`test` database like so:
+You can then set up the [expected tables](storage/mysql/storage.sql) in a `test`
+database like so:
 
 ```bash
 ./scripts/resetdb.sh
-Completely wipe and reset database 'test'.
+Warning: about to destroy and reset database 'test'
 Are you sure? y
+> Resetting DB...
+> Reset Complete
 ```
 
 ### Integration Tests
 
-Trillian also includes an integration test to confirm basic end-to-end
+Trillian includes an integration test suite to confirm basic end-to-end
 functionality, which can be run with:
 
 ```bash
@@ -148,8 +153,10 @@ Re-generating mock or protobuffer files is only needed if you're changing
 the original files; if you do, you'll need to install the prerequisites:
 
   - `mockgen` tool from https://github.com/golang/mock
-  - `protoc` and the Go protoc extension (see documentation linked from the
-    [protobuf site](https://github.com/google/protobuf))
+  - `protoc`, [Go support for protoc](https://github.com/golang/protobuf) and
+     [grpc-gateway](https://github.com/grpc-ecosystem/grpc-gateway) (see
+     documentation linked from the
+     [protobuf site](https://github.com/google/protobuf))
   - protocol buffer definitions for standard Google APIs:
 
     ```bash
@@ -197,13 +204,15 @@ The [`scripts/presubmit.sh`](scripts/presubmit.sh) script runs various tools
 and tests over the codebase.
 
 ```bash
-# Install various codebase checkers
-go get -u github.com/client9/misspell/cmd/misspell
-go get -u github.com/fzipp/gocyclo
-go get -u github.com/gordonklaus/ineffassign
-go get -u github.com/golang/lint/golint
-# Run checks, tests and code generation
+# Install gometalinter and all linters
+go get -u github.com/alecthomas/gometalinter
+gometalinter --install
+
+# Run code generation, build, test and linters
 ./scripts/presubmit.sh
+
+# Or just run the linters alone:
+gometalinter --config=gometalinter.json ./...
 ```
 
 Design
@@ -272,7 +281,7 @@ following available operations:
    these will appear as the next revision of the Map.
 
 (Documentation may be out-of-date; please check the protocol buffer
-[message definitions](trillian_api.proto) for the definitive current API.)
+[message definitions](trillian_map_api.proto) for the definitive current map API.)
 
 Each `SetLeaves` request includes a batch of updates to the Map; once all of
 these updates have been applied, the Map has a new **revision**, with a new tree
@@ -293,7 +302,7 @@ When running in Log mode, Trillian provides a gRPC API whose operations are
 similar to those available for Certificate Transparency logs
 (cf. [RFC 6962](https://tools.ietf.org/html/6962)). These include:
 
- - `GetLastestSignedLogRoot` returns information about the current root of the
+ - `GetLatestSignedLogRoot` returns information about the current root of the
    Merkle tree for the log, including the tree size, hash value, timestamp and
    signature.
  - `GetLeavesByHash` and `GetLeavesByIndex` return leaf information for

@@ -18,19 +18,17 @@ package trees
 
 import (
 	"crypto"
-	"crypto/ecdsa"
-	"crypto/rsa"
 	"fmt"
 
+	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
-	tcrypto "github.com/google/trillian/crypto"
 	"github.com/google/trillian/crypto/keys"
 	"github.com/google/trillian/crypto/sigpb"
 	"github.com/google/trillian/errors"
-	"github.com/google/trillian/merkle"
-	"github.com/google/trillian/merkle/rfc6962"
 	"github.com/google/trillian/storage"
 	"golang.org/x/net/context"
+
+	tcrypto "github.com/google/trillian/crypto"
 )
 
 type treeKey struct{}
@@ -76,8 +74,8 @@ func GetTree(ctx context.Context, s storage.AdminStorage, treeID int64, opts Get
 		return nil, errors.Errorf(errors.InvalidArgument, "operation not allowed for %s-type trees (wanted %s-type)", tree.TreeType, opts.TreeType)
 	case tree.TreeState == trillian.TreeState_FROZEN && !opts.Readonly:
 		return nil, errors.Errorf(errors.FailedPrecondition, "operation not allowed on %s trees", tree.TreeState)
-	case tree.TreeState == trillian.TreeState_SOFT_DELETED || tree.TreeState == trillian.TreeState_HARD_DELETED:
-		return nil, errors.Errorf(errors.NotFound, "deleted tree: %v", tree.TreeId)
+	case tree.Deleted:
+		return nil, errors.Errorf(errors.NotFound, "tree %v not found", tree.TreeId)
 	}
 
 	return tree, nil
@@ -109,22 +107,8 @@ func Hash(tree *trillian.Tree) (crypto.Hash, error) {
 	return crypto.SHA256, fmt.Errorf("unexpected hash algorithm: %s", tree.HashAlgorithm)
 }
 
-// Hasher returns a merkle.TreeHasher of the kind configured for the tree.
-func Hasher(tree *trillian.Tree) (merkle.TreeHasher, error) {
-	hash, err := Hash(tree)
-	if err != nil {
-		return nil, err
-	}
-
-	switch tree.HashStrategy {
-	case trillian.HashStrategy_RFC_6962:
-		return rfc6962.TreeHasher{Hash: hash}, nil
-	}
-	return nil, fmt.Errorf("unexpected hash strategy: %s", tree.HashStrategy)
-}
-
 // Signer returns a Trillian crypto.Signer configured by the tree.
-func Signer(ctx context.Context, sf keys.SignerFactory, tree *trillian.Tree) (*tcrypto.Signer, error) {
+func Signer(ctx context.Context, tree *trillian.Tree) (*tcrypto.Signer, error) {
 	if tree.SignatureAlgorithm == sigpb.DigitallySigned_ANONYMOUS {
 		return nil, fmt.Errorf("signature algorithm not supported: %s", tree.SignatureAlgorithm)
 	}
@@ -134,24 +118,19 @@ func Signer(ctx context.Context, sf keys.SignerFactory, tree *trillian.Tree) (*t
 		return nil, err
 	}
 
-	signer, err := sf.NewSigner(ctx, tree)
+	var keyProto ptypes.DynamicAny
+	if err := ptypes.UnmarshalAny(tree.PrivateKey, &keyProto); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal tree.PrivateKey: %v", err)
+	}
+
+	signer, err := keys.NewSigner(ctx, keyProto.Message)
 	if err != nil {
 		return nil, err
 	}
 
-	var ok bool
-	switch signer.(type) {
-	case *ecdsa.PrivateKey:
-		ok = tree.SignatureAlgorithm == sigpb.DigitallySigned_ECDSA
-	case *rsa.PrivateKey:
-		ok = tree.SignatureAlgorithm == sigpb.DigitallySigned_RSA
-	default:
-		// TODO(codingllama): Make SignatureAlgorithm / key matching part of the SignerFactory contract?
-		// We don't know about custom signers, so let it pass
-		ok = true
+	if tcrypto.SignatureAlgorithm(signer.Public()) != tree.SignatureAlgorithm {
+		return nil, fmt.Errorf("%s signature not supported by signer of type %T", tree.SignatureAlgorithm, signer)
 	}
-	if !ok {
-		return nil, fmt.Errorf("%s signature not supported by key of type %T", tree.SignatureAlgorithm, signer)
-	}
+
 	return &tcrypto.Signer{Hash: hash, Signer: signer}, nil
 }

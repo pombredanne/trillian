@@ -15,6 +15,7 @@
 package server
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"testing"
@@ -25,7 +26,6 @@ import (
 	"github.com/google/trillian/merkle/rfc6962"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/testonly"
-	trillian_testonly "github.com/google/trillian/testonly"
 )
 
 // rehashTest encapsulates one test case for the rehasher in isolation. Input data like the storage
@@ -42,11 +42,11 @@ type rehashTest struct {
 const testTreeRevision int64 = 3
 
 // Raw hashes for dummy storage nodes
-var h1 = th.HashLeaf([]byte("Hash 1"))
-var h2 = th.HashLeaf([]byte("Hash 2"))
-var h3 = th.HashLeaf([]byte("Hash 3"))
-var h4 = th.HashLeaf([]byte("Hash 4"))
-var h5 = th.HashLeaf([]byte("Hash 5"))
+var h1, _ = th.HashLeaf([]byte("Hash 1"))
+var h2, _ = th.HashLeaf([]byte("Hash 2"))
+var h3, _ = th.HashLeaf([]byte("Hash 3"))
+var h4, _ = th.HashLeaf([]byte("Hash 4"))
+var h5, _ = th.HashLeaf([]byte("Hash 5"))
 
 // And the dummy nodes themselves.
 var sn1 = storage.Node{NodeID: storage.NewNodeIDFromHash(h1), Hash: h1, NodeRevision: 11}
@@ -55,21 +55,8 @@ var sn3 = storage.Node{NodeID: storage.NewNodeIDFromHash(h3), Hash: h3, NodeRevi
 var sn4 = storage.Node{NodeID: storage.NewNodeIDFromHash(h4), Hash: h4, NodeRevision: 44}
 var sn5 = storage.Node{NodeID: storage.NewNodeIDFromHash(h5), Hash: h5, NodeRevision: 55}
 
-// And the output proof nodes expected for them.
-var n1 = &trillian.Node{NodeHash: h1}
-var n2 = &trillian.Node{NodeHash: h2}
-var n3 = &trillian.Node{NodeHash: h3}
-var n4 = &trillian.Node{NodeHash: h4}
-var n5 = &trillian.Node{NodeHash: h5}
-
-// Nodes containing composite hashes.
-var n1n2 = &trillian.Node{NodeHash: th.HashChildren(h2, h1)}
-var n2n3 = &trillian.Node{NodeHash: th.HashChildren(h3, h2)}
-var n2n3n4 = &trillian.Node{NodeHash: th.HashChildren(h4, th.HashChildren(h3, h2))}
-var n4n5 = &trillian.Node{NodeHash: th.HashChildren(h5, h4)}
-
 func TestRehasher(t *testing.T) {
-	hasher := rfc6962.Hasher
+	hasher := rfc6962.DefaultHasher
 	rehashTests := []rehashTest{
 		{
 			desc:    "no rehash",
@@ -78,7 +65,7 @@ func TestRehasher(t *testing.T) {
 			fetches: []merkle.NodeFetch{{Rehash: false}, {Rehash: false}, {Rehash: false}},
 			output: trillian.Proof{
 				LeafIndex: 126,
-				ProofNode: []*trillian.Node{n1, n2, n3},
+				Hashes:    [][]byte{h1, h2, h3},
 			},
 		},
 		{
@@ -88,7 +75,7 @@ func TestRehasher(t *testing.T) {
 			fetches: []merkle.NodeFetch{{Rehash: false}, {Rehash: true}, {Rehash: true}, {Rehash: false}, {Rehash: false}},
 			output: trillian.Proof{
 				LeafIndex: 999,
-				ProofNode: []*trillian.Node{n1, n2n3, n4, n5},
+				Hashes:    [][]byte{h1, th.HashChildren(h3, h2), h4, h5},
 			},
 		},
 		{
@@ -98,7 +85,7 @@ func TestRehasher(t *testing.T) {
 			fetches: []merkle.NodeFetch{{Rehash: false}, {Rehash: true}, {Rehash: true}},
 			output: trillian.Proof{
 				LeafIndex: 11,
-				ProofNode: []*trillian.Node{n1, n2n3},
+				Hashes:    [][]byte{h1, th.HashChildren(h3, h2)},
 			},
 		},
 		{
@@ -108,7 +95,7 @@ func TestRehasher(t *testing.T) {
 			fetches: []merkle.NodeFetch{{Rehash: false}, {Rehash: true}, {Rehash: true}, {Rehash: true}, {Rehash: false}},
 			output: trillian.Proof{
 				LeafIndex: 23,
-				ProofNode: []*trillian.Node{n1, n2n3n4, n5},
+				Hashes:    [][]byte{h1, th.HashChildren(h4, th.HashChildren(h3, h2)), h5},
 			},
 		},
 		{
@@ -118,7 +105,7 @@ func TestRehasher(t *testing.T) {
 			fetches: []merkle.NodeFetch{{Rehash: true}, {Rehash: true}, {Rehash: false}, {Rehash: true}, {Rehash: true}},
 			output: trillian.Proof{
 				LeafIndex: 45,
-				ProofNode: []*trillian.Node{n1n2, n3, n4n5},
+				Hashes:    [][]byte{th.HashChildren(h2, h1), h3, th.HashChildren(h5, h4)},
 			},
 		},
 	}
@@ -143,7 +130,8 @@ func TestRehasher(t *testing.T) {
 }
 
 func TestTree813FetchAll(t *testing.T) {
-	hasher := rfc6962.Hasher
+	ctx := context.Background()
+	hasher := rfc6962.DefaultHasher
 	const ts int64 = 813
 
 	mt := treeAtSize(int(ts))
@@ -158,7 +146,7 @@ func TestTree813FetchAll(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		proof, err := fetchNodesAndBuildProof(r, hasher, testTreeRevision, int64(l), fetches)
+		proof, err := fetchNodesAndBuildProof(ctx, r, hasher, testTreeRevision, int64(l), fetches)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -166,23 +154,24 @@ func TestTree813FetchAll(t *testing.T) {
 		// We use +1 here because of the 1 based leaf indexing of this implementation
 		refProof := mt.PathToRootAtSnapshot(l+1, ts)
 
-		if got, want := len(proof.ProofNode), len(refProof); got != want {
+		if got, want := len(proof.Hashes), len(refProof); got != want {
 			for i, f := range fetches {
 				t.Errorf("Fetch: %d => %s", i, f.NodeID.CoordString())
 			}
 			t.Fatalf("(%d, %d): got proof len: %d, want: %d: %v\n%v", ts, l, got, want, fetches, refProof)
 		}
 
-		for i := 0; i < len(proof.ProofNode); i++ {
-			if got, want := hex.EncodeToString(proof.ProofNode[i].NodeHash), hex.EncodeToString(refProof[i].Value.Hash()); got != want {
-				t.Fatalf("(%d, %d): %d got proof node: %s, want: %s l:%d fetches: %v", ts, l, i, got, want, len(proof.ProofNode), fetches)
+		for i := 0; i < len(proof.Hashes); i++ {
+			if got, want := hex.EncodeToString(proof.Hashes[i]), hex.EncodeToString(refProof[i].Value.Hash()); got != want {
+				t.Fatalf("(%d, %d): %d got proof node: %s, want: %s l:%d fetches: %v", ts, l, i, got, want, len(proof.Hashes), fetches)
 			}
 		}
 	}
 }
 
 func TestTree32InclusionProofFetchAll(t *testing.T) {
-	hasher := rfc6962.Hasher
+	ctx := context.Background()
+	hasher := rfc6962.DefaultHasher
 	for ts := 2; ts <= 32; ts++ {
 		mt := treeAtSize(ts)
 		r := testonly.NewMultiFakeNodeReaderFromLeaves([]testonly.LeafBatch{
@@ -196,7 +185,7 @@ func TestTree32InclusionProofFetchAll(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				proof, err := fetchNodesAndBuildProof(r, hasher, testTreeRevision, int64(l), fetches)
+				proof, err := fetchNodesAndBuildProof(ctx, r, hasher, testTreeRevision, int64(l), fetches)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -204,13 +193,13 @@ func TestTree32InclusionProofFetchAll(t *testing.T) {
 				// We use +1 here because of the 1 based leaf indexing of this implementation
 				refProof := mt.PathToRootAtSnapshot(l+1, s)
 
-				if got, want := len(proof.ProofNode), len(refProof); got != want {
+				if got, want := len(proof.Hashes), len(refProof); got != want {
 					t.Fatalf("(%d, %d, %d): got proof len: %d, want: %d: %v\n%v", ts, s, l, got, want, fetches, refProof)
 				}
 
-				for i := 0; i < len(proof.ProofNode); i++ {
-					if got, want := hex.EncodeToString(proof.ProofNode[i].NodeHash), hex.EncodeToString(refProof[i].Value.Hash()); got != want {
-						t.Fatalf("(%d, %d, %d): %d got proof node: %s, want: %s l:%d fetches: %v", ts, s, l, i, got, want, len(proof.ProofNode), fetches)
+				for i := 0; i < len(proof.Hashes); i++ {
+					if got, want := hex.EncodeToString(proof.Hashes[i]), hex.EncodeToString(refProof[i].Value.Hash()); got != want {
+						t.Fatalf("(%d, %d, %d): %d got proof node: %s, want: %s l:%d fetches: %v", ts, s, l, i, got, want, len(proof.Hashes), fetches)
 					}
 				}
 			}
@@ -219,7 +208,8 @@ func TestTree32InclusionProofFetchAll(t *testing.T) {
 }
 
 func TestTree32InclusionProofFetchMultiBatch(t *testing.T) {
-	hasher := rfc6962.Hasher
+	ctx := context.Background()
+	hasher := rfc6962.DefaultHasher
 
 	mt := treeAtSize(32)
 	// The reader is built up with multiple batches, 4 batches x 8 leaves each
@@ -238,7 +228,7 @@ func TestTree32InclusionProofFetchMultiBatch(t *testing.T) {
 			}
 
 			// Use the highest tree revision that should be available from the node reader
-			proof, err := fetchNodesAndBuildProof(r, hasher, testTreeRevision+3, l, fetches)
+			proof, err := fetchNodesAndBuildProof(ctx, r, hasher, testTreeRevision+3, l, fetches)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -246,13 +236,13 @@ func TestTree32InclusionProofFetchMultiBatch(t *testing.T) {
 			// We use +1 here because of the 1 based leaf indexing of this implementation
 			refProof := mt.PathToRootAtSnapshot(l+1, s)
 
-			if got, want := len(proof.ProofNode), len(refProof); got != want {
+			if got, want := len(proof.Hashes), len(refProof); got != want {
 				t.Fatalf("(%d, %d, %d): got proof len: %d, want: %d: %v\n%v", 32, s, l, got, want, fetches, refProof)
 			}
 
-			for i := 0; i < len(proof.ProofNode); i++ {
-				if got, want := hex.EncodeToString(proof.ProofNode[i].NodeHash), hex.EncodeToString(refProof[i].Value.Hash()); got != want {
-					t.Fatalf("(%d, %d, %d): %d got proof node: %s, want: %s l:%d fetches: %v", 32, s, l, i, got, want, len(proof.ProofNode), fetches)
+			for i := 0; i < len(proof.Hashes); i++ {
+				if got, want := hex.EncodeToString(proof.Hashes[i]), hex.EncodeToString(refProof[i].Value.Hash()); got != want {
+					t.Fatalf("(%d, %d, %d): %d got proof node: %s, want: %s l:%d fetches: %v", 32, s, l, i, got, want, len(proof.Hashes), fetches)
 				}
 			}
 		}
@@ -260,7 +250,8 @@ func TestTree32InclusionProofFetchMultiBatch(t *testing.T) {
 }
 
 func TestTree32ConsistencyProofFetchAll(t *testing.T) {
-	hasher := rfc6962.Hasher
+	ctx := context.Background()
+	hasher := rfc6962.DefaultHasher
 	for ts := 2; ts <= 32; ts++ {
 		mt := treeAtSize(ts)
 		r := testonly.NewMultiFakeNodeReaderFromLeaves([]testonly.LeafBatch{
@@ -274,20 +265,20 @@ func TestTree32ConsistencyProofFetchAll(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				proof, err := fetchNodesAndBuildProof(r, hasher, testTreeRevision, int64(s1), fetches)
+				proof, err := fetchNodesAndBuildProof(ctx, r, hasher, testTreeRevision, int64(s1), fetches)
 				if err != nil {
 					t.Fatal(err)
 				}
 
 				refProof := mt.SnapshotConsistency(s1, s2)
 
-				if got, want := len(proof.ProofNode), len(refProof); got != want {
+				if got, want := len(proof.Hashes), len(refProof); got != want {
 					t.Fatalf("(%d, %d, %d): got proof len: %d, want: %d: %v\n%v", ts, s1, s2, got, want, fetches, refProof)
 				}
 
-				for i := 0; i < len(proof.ProofNode); i++ {
-					if got, want := hex.EncodeToString(proof.ProofNode[i].NodeHash), hex.EncodeToString(refProof[i].Value.Hash()); got != want {
-						t.Fatalf("(%d, %d, %d): %d got proof node: %s, want: %s l:%d fetches: %v", ts, s1, s2, i, got, want, len(proof.ProofNode), fetches)
+				for i := 0; i < len(proof.Hashes); i++ {
+					if got, want := hex.EncodeToString(proof.Hashes[i]), hex.EncodeToString(refProof[i].Value.Hash()); got != want {
+						t.Fatalf("(%d, %d, %d): %d got proof node: %s, want: %s l:%d fetches: %v", ts, s1, s2, i, got, want, len(proof.Hashes), fetches)
 					}
 				}
 			}
@@ -311,9 +302,11 @@ func expectedRootAtSize(mt *merkle.InMemoryMerkleTree) []byte {
 
 func treeAtSize(n int) *merkle.InMemoryMerkleTree {
 	leaves := expandLeaves(0, n-1)
-	mt := merkle.NewInMemoryMerkleTree(trillian_testonly.Hasher)
+	mt := merkle.NewInMemoryMerkleTree(rfc6962.DefaultHasher)
 	for _, leaf := range leaves {
-		mt.AddLeaf([]byte(leaf))
+		if _, _, err := mt.AddLeaf([]byte(leaf)); err != nil {
+			panic(err)
+		}
 	}
 	return mt
 }

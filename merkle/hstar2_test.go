@@ -16,73 +16,85 @@ package merkle
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"math/big"
 	"testing"
 
+	"github.com/google/trillian/merkle/hashers"
+	"github.com/google/trillian/merkle/maphasher"
+	"github.com/google/trillian/storage"
 	"github.com/google/trillian/testonly"
 )
 
-// This root was calculated with the C++/Python sparse Merkle tree code in the
+const treeID = int64(0)
+
+var (
+	deB64 = testonly.MustDecodeBase64
+)
+
+// Some known answers for incrementally adding index/value pairs to a sparse tree.
+// rootB64 is the incremental root after adding the corresponding i/v pair, and
+// all i/v pairs which come before it.
+//
+// Values were calculated with the C++/Python sparse Merkle tree code in the
 // github.com/google/certificate-transparency repo.
 // TODO(alcutter): replace with hash-dependent computation. How is this computed?
-var sparseEmptyRootHashB64 = testonly.MustDecodeBase64("xmifEIEqCYCXbZUz2Dh1KCFmFZVn7DUVVxbBQTr1PWo=")
-
-// createHStar2Leaves builds a list of HStar2LeafHash structs suitable for
-// passing into a the HStar2 sparse Merkle tree implementation.
-// The map keys will be SHA256 hashed before being added to the returned
-// structs.
-func createHStar2Leaves(th TreeHasher, values map[string]string) []HStar2LeafHash {
-	r := []HStar2LeafHash{}
-	for k := range values {
-		khash := sha256.Sum256([]byte(k))
-		vhash := th.HashLeaf([]byte(values[k]))
-		r = append(r, HStar2LeafHash{
-			Index:    new(big.Int).SetBytes(khash[:]),
-			LeafHash: vhash[:],
-		})
-	}
-	return r
-}
-
-func TestHStar2EmptyRootKAT(t *testing.T) {
-	s := NewHStar2(testonly.Hasher)
-	root, err := s.HStar2Root(s.hasher.Size()*8, []HStar2LeafHash{})
-	if err != nil {
-		t.Fatalf("Failed to calculate root: %v", err)
-	}
-	if got, want := root, sparseEmptyRootHashB64; !bytes.Equal(got, want) {
-		t.Fatalf("Expected empty root. Got: \n%x\nWant:\n%x", got, want)
-	}
-}
-
-// Some known answers for incrementally adding key/value pairs to a sparse tree.
-// rootB64 is the incremental root after adding the corresponding k/v pair, and
-// all k/v pairs which come before it.
 var simpleTestVector = []struct {
-	k, v string
-	root []byte
+	index, value, root []byte
 }{
-	{"a", "0", testonly.MustDecodeBase64("nP1psZp1bu3jrY5Yv89rI+w5ywe9lLqI2qZi5ibTSF0=")},
-	{"b", "1", testonly.MustDecodeBase64("EJ1Rw6DQT9bDn2Zbn7u+9/j799PSdqT9gfBymS9MBZY=")},
-	{"a", "2", testonly.MustDecodeBase64("2rAZz4HJAMJqJ5c8ClS4wEzTP71GTdjMZMe1rKWPA5o=")},
+	{nil, nil, deB64("xmifEIEqCYCXbZUz2Dh1KCFmFZVn7DUVVxbBQTr1PWo=")}, // Empty tree.
+	{testonly.HashKey("a"), []byte("0"), deB64("nP1psZp1bu3jrY5Yv89rI+w5ywe9lLqI2qZi5ibTSF0=")},
+	{testonly.HashKey("b"), []byte("1"), deB64("EJ1Rw6DQT9bDn2Zbn7u+9/j799PSdqT9gfBymS9MBZY=")},
+	{testonly.HashKey("a"), []byte("2"), deB64("2rAZz4HJAMJqJ5c8ClS4wEzTP71GTdjMZMe1rKWPA5o=")},
+}
+
+// createHStar2Leaves returns a []HStar2LeafHash formed by the mapping of index, value ...
+// createHStar2Leaves panics if len(iv) is odd. Duplicate i/v pairs get over written.
+func createHStar2Leaves(treeID int64, hasher hashers.MapHasher, iv ...[]byte) ([]HStar2LeafHash, error) {
+	if len(iv)%2 != 0 {
+		panic(fmt.Sprintf("merkle: createHstar2Leaves got odd number of iv pairs: %v", len(iv)))
+	}
+	m := make(map[string]HStar2LeafHash)
+	var index []byte
+	for i, b := range iv {
+		if i%2 == 0 {
+			index = b
+			continue
+		}
+		leafHash, err := hasher.HashLeaf(treeID, index, b)
+		if err != nil {
+			return nil, err
+		}
+		m[fmt.Sprintf("%x", index)] = HStar2LeafHash{
+			Index:    new(big.Int).SetBytes(index),
+			LeafHash: leafHash,
+		}
+	}
+
+	r := make([]HStar2LeafHash, 0, len(m))
+	for _, v := range m {
+		r = append(r, v)
+	}
+	return r, nil
 }
 
 func TestHStar2SimpleDataSetKAT(t *testing.T) {
-	s := NewHStar2(testonly.Hasher)
+	s := NewHStar2(treeID, maphasher.Default)
 
-	m := make(map[string]string)
+	iv := [][]byte{}
 	for i, x := range simpleTestVector {
-		m[x.k] = x.v
-		values := createHStar2Leaves(testonly.Hasher, m)
-		root, err := s.HStar2Root(s.hasher.Size()*8, values)
+		iv = append(iv, x.index, x.value)
+		values, err := createHStar2Leaves(treeID, maphasher.Default, iv...)
 		if err != nil {
-			t.Fatalf("Failed to calculate root at iteration %d: %v", i, err)
+			t.Fatalf("createHStar2Leaves(): %v", err)
 		}
-		if expected, got := x.root, root; !bytes.Equal(expected, got) {
-			t.Fatalf("Expected root:\n%v\nGot:\n%v", base64.StdEncoding.EncodeToString(expected), base64.StdEncoding.EncodeToString(got))
+		root, err := s.HStar2Root(s.hasher.BitLen(), values)
+		if err != nil {
+			t.Errorf("Failed to calculate root at iteration %d: %v", i, err)
+			continue
+		}
+		if got, want := root, x.root; !bytes.Equal(got, want) {
+			t.Errorf("Root: %x, want: %x", got, want)
 		}
 	}
 }
@@ -93,17 +105,19 @@ func TestHStar2GetSet(t *testing.T) {
 	// Node cache is shared between tree builds and in effect plays the role of
 	// the TreeStorage layer.
 	cache := make(map[string][]byte)
+	hasher := maphasher.Default
 
 	for i, x := range simpleTestVector {
-		s := NewHStar2(testonly.Hasher)
-		m := make(map[string]string)
-		m[x.k] = x.v
-		values := createHStar2Leaves(testonly.Hasher, m)
+		s := NewHStar2(treeID, hasher)
+		values, err := createHStar2Leaves(treeID, hasher, x.index, x.value)
+		if err != nil {
+			t.Fatalf("createHStar2Leaves(): %v", err)
+		}
 		// ensure we're going incrementally, one leaf at a time.
 		if len(values) != 1 {
 			t.Fatalf("Should only have 1 leaf per run, got %d", len(values))
 		}
-		root, err := s.HStar2Nodes(s.hasher.Size()*8, 0, values,
+		root, err := s.HStar2Nodes(nil, s.hasher.BitLen(), values,
 			func(depth int, index *big.Int) ([]byte, error) {
 				return cache[fmt.Sprintf("%x/%d", index, depth)], nil
 			},
@@ -112,28 +126,11 @@ func TestHStar2GetSet(t *testing.T) {
 				return nil
 			})
 		if err != nil {
-			t.Fatalf("Failed to calculate root at iteration %d: %v", i, err)
+			t.Errorf("Failed to calculate root at iteration %d: %v", i, err)
+			continue
 		}
-		if expected, got := x.root, root; !bytes.Equal(expected, got) {
-			t.Fatalf("Expected root:\n%v\nGot:\n%v", base64.StdEncoding.EncodeToString(expected), base64.StdEncoding.EncodeToString(got))
-		}
-	}
-}
-
-// Checks that we calculate the same empty root hash as a 256-level tree has
-// when calculating top subtrees using an appropriate offset.
-func TestHStar2OffsetEmptyRootKAT(t *testing.T) {
-	s := NewHStar2(testonly.Hasher)
-
-	for size := 1; size < 255; size++ {
-		root, err := s.HStar2Nodes(size, s.hasher.Size()*8-size, []HStar2LeafHash{},
-			func(int, *big.Int) ([]byte, error) { return nil, nil },
-			func(int, *big.Int, []byte) error { return nil })
-		if err != nil {
-			t.Fatalf("Failed to calculate root %v", err)
-		}
-		if expected, got := sparseEmptyRootHashB64, root; !bytes.Equal(expected, got) {
-			t.Fatalf("Expected root:\n%v\nGot:\n%v", base64.StdEncoding.EncodeToString(expected), base64.StdEncoding.EncodeToString(got))
+		if got, want := root, x.root; !bytes.Equal(got, want) {
+			t.Errorf("Root: %x, want: %x", got, want)
 		}
 	}
 }
@@ -143,20 +140,25 @@ func TestHStar2OffsetEmptyRootKAT(t *testing.T) {
 // 256-prefixSize, and can be passed in as leaves to top-subtree calculation.
 func rootsForTrimmedKeys(t *testing.T, prefixSize int, lh []HStar2LeafHash) []HStar2LeafHash {
 	var ret []HStar2LeafHash
-	s := NewHStar2(testonly.Hasher)
+	hasher := maphasher.Default
+	s := NewHStar2(treeID, hasher)
 	for i := range lh {
-		prefix := new(big.Int).Rsh(lh[i].Index, uint(s.hasher.Size()*8-prefixSize))
-		b := lh[i].Index.Bytes()
-		// ensure we've got any chopped of leading zero bytes
-		for len(b) < 32 {
-			b = append([]byte{0}, b...)
+		subtreeDepth := s.hasher.BitLen() - prefixSize
+		prefix := lh[i].Index.Bytes()
+		// Left pad prefix with zeros back out to 32 bytes.
+		for len(prefix) < 32 {
+			prefix = append([]byte{0}, prefix...)
 		}
-		lh[i].Index.SetBytes(b[prefixSize/8:])
-		root, err := s.HStar2Root(s.hasher.Size()*8-prefixSize, []HStar2LeafHash{lh[i]})
+		prefix = prefix[:prefixSize/8] // We only want the first prefixSize bytes.
+		root, err := s.HStar2Nodes(prefix, subtreeDepth, []HStar2LeafHash{lh[i]}, nil, nil)
 		if err != nil {
 			t.Fatalf("Failed to calculate root %v", err)
 		}
-		ret = append(ret, HStar2LeafHash{prefix, root})
+
+		ret = append(ret, HStar2LeafHash{
+			Index:    storage.NewNodeIDFromPrefixSuffix(prefix, storage.Suffix{}, hasher.BitLen()).BigInt(),
+			LeafHash: root,
+		})
 	}
 	return ret
 }
@@ -165,38 +167,37 @@ func rootsForTrimmedKeys(t *testing.T, prefixSize int, lh []HStar2LeafHash) []HS
 // (single top subtree of size n, and multipl bottom subtrees of size 256-n)
 // still arrives at the same Known Answers for root hash.
 func TestHStar2OffsetRootKAT(t *testing.T) {
-	s := NewHStar2(testonly.Hasher)
-
-	m := make(map[string]string)
-
+	s := NewHStar2(treeID, maphasher.Default)
+	iv := [][]byte{}
 	for i, x := range simpleTestVector {
+		iv = append(iv, x.index, x.value)
 		// start at 24 so we can assume that key prefixes are probably unique by then
 		// TODO(al): improve rootsForTrimmedKeys to use a map and remove this
 		// requirement.
 		for size := 24; size < 256; size += 8 {
-			m[x.k] = x.v
-			intermediates := rootsForTrimmedKeys(t, size, createHStar2Leaves(testonly.Hasher, m))
-
-			root, err := s.HStar2Nodes(size, s.hasher.Size()*8-size, intermediates,
-				func(int, *big.Int) ([]byte, error) { return nil, nil },
-				func(int, *big.Int, []byte) error { return nil })
+			leaves, err := createHStar2Leaves(treeID, maphasher.Default, iv...)
 			if err != nil {
-				t.Fatalf("Failed to calculate root at iteration %d: %v", i, err)
+				t.Fatalf("createHStar2Leaves(): %v", err)
 			}
-			if expected, got := x.root, root; !bytes.Equal(expected, got) {
-				t.Fatalf("Expected root:\n%v\nGot:\n%v", base64.StdEncoding.EncodeToString(expected), base64.StdEncoding.EncodeToString(got))
+			intermediates := rootsForTrimmedKeys(t, size, leaves)
+
+			root, err := s.HStar2Nodes(nil, size, intermediates, nil, nil)
+			if err != nil {
+				t.Errorf("Failed to calculate root at iteration %d: %v", i, err)
+				continue
+			}
+			if got, want := root, x.root; !bytes.Equal(got, want) {
+				t.Errorf("HStar2Nodes(i: %v, size:%v): %x, want: %x", i, size, got, want)
 			}
 		}
 	}
 }
 
 func TestHStar2NegativeTreeLevelOffset(t *testing.T) {
-	s := NewHStar2(testonly.Hasher)
+	s := NewHStar2(treeID, maphasher.Default)
 
-	_, err := s.HStar2Nodes(32, -1, []HStar2LeafHash{},
-		func(int, *big.Int) ([]byte, error) { return nil, nil },
-		func(int, *big.Int, []byte) error { return nil })
-	if expected, got := ErrNegativeTreeLevelOffset, err; expected != got {
-		t.Fatalf("expected %v, but got %v", expected, got)
+	_, err := s.HStar2Nodes(make([]byte, 31), 9, []HStar2LeafHash{}, nil, nil)
+	if got, want := err, ErrSubtreeOverrun; got != want {
+		t.Fatalf("Hstar2Nodes(): %v, want %v", got, want)
 	}
 }

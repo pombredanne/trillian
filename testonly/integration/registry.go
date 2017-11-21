@@ -15,23 +15,25 @@
 package integration
 
 import (
-	"github.com/google/trillian/crypto/keys"
+	"context"
+
 	"github.com/google/trillian/extension"
+	"github.com/google/trillian/quota/mysqlqm"
 	"github.com/google/trillian/storage/mysql"
+	"github.com/google/trillian/storage/testdb"
 )
 
 // NewRegistryForTests returns an extension.Registry for integration tests.
-// A new database will be recreated, as per GetTestDB.
-func NewRegistryForTests(testID string) (extension.Registry, error) {
-	db, err := GetTestDB(testID)
+func NewRegistryForTests(ctx context.Context) (extension.Registry, error) {
+	db, err := testdb.NewTrillianDB(ctx)
 	if err != nil {
 		return extension.Registry{}, err
 	}
 
 	return extension.Registry{
-		AdminStorage:  mysql.NewAdminStorage(db),
-		SignerFactory: keys.PEMSignerFactory{},
-		LogStorage:    mysql.NewLogStorage(db),
-		MapStorage:    mysql.NewMapStorage(db),
+		AdminStorage: mysql.NewAdminStorage(db),
+		LogStorage:   mysql.NewLogStorage(db, nil),
+		MapStorage:   mysql.NewMapStorage(db),
+		QuotaManager: &mysqlqm.QuotaManager{DB: db, MaxUnsequencedRows: mysqlqm.DefaultMaxUnsequenced},
 	}, nil
 }

@@ -23,9 +23,6 @@
 # initialized, creates the database according to the following environment
 # variables:
 # - $MYSQL_ROOT_PASSWORD
-# - $MYSQL_DATABASE
-# - $MYSQL_USER
-# - $MYSQL_PASSWORD
 # - $WSREP_SST_USER
 # - $WSREP_SST_PASSWORD
 # 2. Configures MySQL for the Galera cluster.
@@ -65,19 +62,22 @@ fi
 INIT_SQL=$(mktemp)
 chmod 0600 "${INIT_SQL}"
 
-# Create the following users:
+# Create/alter the following users:
 # - root user for administrative purposes.
 # - dummy user with no password or rights, for use by health checks.
 # - SST user for use by Galera to replicate database state between nodes.
 # TODO(robpercival): Restrict root access.
 cat > "$INIT_SQL" <<EOSQL
-DELETE FROM mysql.user;
-CREATE USER 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+DROP USER IF EXISTS 'root'@'localhost';
+ALTER USER IF EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
 GRANT ALL ON *.* TO 'root'@'%' WITH GRANT OPTION;
 
-CREATE USER 'dummy'@'localhost';
+CREATE USER IF NOT EXISTS 'dummy'@'localhost';
+REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'dummy'@'localhost';
 
-CREATE USER '${WSREP_SST_USER}'@'localhost' IDENTIFIED BY '${WSREP_SST_PASSWORD}';
+ALTER USER IF EXISTS '${WSREP_SST_USER}'@'localhost' IDENTIFIED BY '${WSREP_SST_PASSWORD}';
+CREATE USER IF NOT EXISTS '${WSREP_SST_USER}'@'localhost' IDENTIFIED BY '${WSREP_SST_PASSWORD}';
 GRANT PROCESS, RELOAD, LOCK TABLES, REPLICATION CLIENT ON *.* TO '${WSREP_SST_USER}'@'localhost';
 FLUSH PRIVILEGES;
 EOSQL
@@ -91,24 +91,20 @@ if [ -n "$WSREP_NODE_ADDRESS" ]; then
   sed -i -e "s|^wsrep_node_address=.*$|wsrep_node_address=${WSREP_NODE_ADDRESS}|" /etc/mysql/conf.d/cluster.cnf
 fi
 
-# Set wsrep_cluster_address so that this node connects to all nodes that are
-# already setup (the Kubernetes StatefulSet attempts to start the nodes in
-# order). If this is the first node, it will bootstrap the cluster.
-if [[ "$(hostname)" =~ ^(.*)-([0-9]+)$ ]]; then
-  statefulset_name="${BASH_REMATCH[1]}"
-  replica_index=${BASH_REMATCH[2]}
-  domain="galera"
-  cluster_address="gcomm://"
+cluster_address="gcomm://"
 
-  for ((i=0; i < $replica_index; i++)); do
-    cluster_address+="${statefulset_name}-${i}.${domain},"
-  done
+# Lookup "galera" in Kubernetes DNS. This should return the IP addresses of
+# any running Galera nodes. If none are running, this node should bootstrap the
+# cluster.
+for ip in $(dig +short +search galera); do
+  # Do a reverse DNS lookup of the IP so the hostname can be used instead.
+  # This makes it easier to identify nodes in the Galera logs.
+  hostname=$(dig +short +search -x "${ip}")
+  cluster_address+="${hostname},"
+done
 
-  sed -i -e "s|^wsrep_cluster_address=gcomm://|wsrep_cluster_address=${cluster_address}|" /etc/mysql/conf.d/cluster.cnf
-else
-  echo >&2 'error: expected hostname to be of the form "foo-N"'
-  exit 1
-fi
+echo "Galera cluster address: ${cluster_address}"
+sed -i -e "s|^wsrep_cluster_address=gcomm://.*$|wsrep_cluster_address=${cluster_address}|" /etc/mysql/conf.d/cluster.cnf
 
 # Provide a random server ID for this replica.
 sed -i -e "s/^server\-id=.*$/server-id=${RANDOM}/" /etc/mysql/my.cnf

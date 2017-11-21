@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// The fetch_leaves program retrieves leaves from a tree.
 package main
 
 import (
@@ -54,7 +55,7 @@ func main() {
 	}
 	defer db.Close()
 
-	storage := mysql.NewLogStorage(db)
+	storage := mysql.NewLogStorage(db, nil)
 	ctx := context.Background()
 	tx, err := storage.SnapshotForTree(ctx, *treeIDFlag)
 	if err != nil {

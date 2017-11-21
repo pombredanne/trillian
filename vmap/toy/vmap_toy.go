@@ -26,7 +26,7 @@ import (
 	"github.com/google/trillian"
 	spb "github.com/google/trillian/crypto/sigpb"
 	"github.com/google/trillian/merkle"
-	"github.com/google/trillian/merkle/rfc6962"
+	"github.com/google/trillian/merkle/maphasher"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/mysql"
 	"github.com/google/trillian/testonly"
@@ -47,7 +47,7 @@ func main() {
 
 	mapID := int64(1)
 	ms := mysql.NewMapStorage(db)
-	hasher := merkle.NewMapHasher(rfc6962.Hasher)
+	hasher := maphasher.Default
 
 	testVecs := []struct {
 		batchSize       int
@@ -84,7 +84,11 @@ func main() {
 			glog.Exitf("Failed to Begin() a new tx: %v", err)
 		}
 		defer tx.Close()
-		w, err := merkle.NewSparseMerkleTreeWriter(tx.WriteRevision(), hasher,
+		w, err := merkle.NewSparseMerkleTreeWriter(
+			ctx,
+			mapID,
+			tx.WriteRevision(),
+			hasher,
 			func() (storage.TreeTX, error) {
 				return ms.BeginForTree(ctx, mapID)
 			})
@@ -95,13 +99,18 @@ func main() {
 		glog.Infof("Starting batch %d...", x)
 		h := make([]merkle.HashKeyValue, batchSize)
 		for y := 0; y < batchSize; y++ {
-			h[y].HashedKey = testonly.HashKey(fmt.Sprintf("key-%d-%d", x, y))
-			h[y].HashedValue = hasher.TreeHasher.HashLeaf([]byte(fmt.Sprintf("value-%d-%d", x, y)))
+			index := testonly.HashKey(fmt.Sprintf("key-%d-%d", x, y))
+			leafHash, err := hasher.HashLeaf(mapID, index, []byte(fmt.Sprintf("value-%d-%d", x, y)))
+			if err != nil {
+				glog.Exitf("HashLeaf(): %v", err)
+			}
+			h[y].HashedKey = index
+			h[y].HashedValue = leafHash
 		}
 		glog.Infof("Created %d k/v pairs...", len(h))
 
 		glog.Info("SetLeaves...")
-		if err := w.SetLeaves(h); err != nil {
+		if err := w.SetLeaves(ctx, h); err != nil {
 			glog.Exitf("Failed to batch %d: %v", x, err)
 		}
 		glog.Info("SetLeaves done.")
@@ -120,7 +129,7 @@ func main() {
 			MapRevision:    tx.WriteRevision(),
 			Signature:      &spb.DigitallySigned{},
 		}); err != nil {
-			glog.Exitf("Failed to store SMH: %v", err)
+			glog.Exitf("Failed to store SMR: %v", err)
 		}
 
 		if err := tx.Commit(); err != nil {

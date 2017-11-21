@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package extension provides an extension mechanism for Trillian code to access
+// fork-specific functionality.
 package extension
 
 import (
 	"github.com/google/trillian/crypto/keys"
+	"github.com/google/trillian/monitoring"
+	"github.com/google/trillian/quota"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/util"
 )
@@ -30,8 +34,15 @@ type Registry struct {
 	storage.LogStorage
 	// MapStorage is the storage implementation to use for persisting maps.
 	storage.MapStorage
-	// SignerFactory provides the keys used for generating signatures for each tree.
-	keys.SignerFactory
 	// ElectionFactory provides MasterElection instances for each tree.
 	util.ElectionFactory
+	// QuotaManager provides rate limiting capabilities for Trillian.
+	QuotaManager quota.Manager
+	// MetricFactory provides metrics for monitoring.
+	monitoring.MetricFactory
+	// NewKeyProto creates a new private key based on a key specification.
+	// It returns a proto that can be passed to a keys.ProtoHandler to get a crypto.Signer.
+	NewKeyProto keys.ProtoGenerator
+	// SetProcessStatus sets the current process status for diagnostic purposes.
+	SetProcessStatus func(string)
 }

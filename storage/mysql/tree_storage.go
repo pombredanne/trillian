@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package mysql provides a MySQL-based storage layer implementation.
 package mysql
 
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"sync"
@@ -33,9 +35,8 @@ const (
 	insertSubtreeMultiSQL = `INSERT INTO Subtree(TreeId, SubtreeId, Nodes, SubtreeRevision) ` + placeholderSQL
 	insertTreeHeadSQL     = `INSERT INTO TreeHead(TreeId,TreeHeadTimestamp,TreeSize,RootHash,TreeRevision,RootSignature)
 		 VALUES(?,?,?,?,?,?)`
-	selectTreeRevisionAtSizeOrLargerSQL = "SELECT TreeRevision,TreeSize FROM TreeHead WHERE TreeId=? AND TreeSize>=? ORDER BY TreeRevision LIMIT 1"
-	selectActiveLogsSQL                 = "SELECT TreeId from Trees where TreeType='LOG'"
-	selectActiveLogsWithUnsequencedSQL  = "SELECT DISTINCT t.TreeId from Trees t INNER JOIN Unsequenced u WHERE TreeType='LOG' AND t.TreeId=u.TreeId"
+	selectNonDeletedTreeIDByTypeAndStateSQL = "SELECT TreeId FROM Trees WHERE TreeType = ? AND TreeState = ? AND (Deleted IS NULL OR Deleted = 'false')"
+	selectTreeRevisionAtSizeOrLargerSQL     = "SELECT TreeRevision,TreeSize FROM TreeHead WHERE TreeId=? AND TreeSize>=? ORDER BY TreeRevision LIMIT 1"
 
 	selectSubtreeSQL = `
  SELECT x.SubtreeId, x.MaxRevision, Subtree.Nodes
@@ -106,7 +107,7 @@ func expandPlaceholderSQL(sql string, num int, first, rest string) string {
 // and number of bound arguments.
 // TODO(al,martin): consider pulling this all out as a separate unit for reuse
 // elsewhere.
-func (m *mySQLTreeStorage) getStmt(statement string, num int, first, rest string) (*sql.Stmt, error) {
+func (m *mySQLTreeStorage) getStmt(ctx context.Context, statement string, num int, first, rest string) (*sql.Stmt, error) {
 	m.statementMutex.Lock()
 	defer m.statementMutex.Unlock()
 
@@ -120,7 +121,7 @@ func (m *mySQLTreeStorage) getStmt(statement string, num int, first, rest string
 		m.statements[statement] = make(map[int]*sql.Stmt)
 	}
 
-	s, err := m.db.PrepareContext(context.TODO(), expandPlaceholderSQL(statement, num, first, rest))
+	s, err := m.db.PrepareContext(ctx, expandPlaceholderSQL(statement, num, first, rest))
 
 	if err != nil {
 		glog.Warningf("Failed to prepare statement %d: %s", num, err)
@@ -132,15 +133,15 @@ func (m *mySQLTreeStorage) getStmt(statement string, num int, first, rest string
 	return s, nil
 }
 
-func (m *mySQLTreeStorage) getSubtreeStmt(num int) (*sql.Stmt, error) {
-	return m.getStmt(selectSubtreeSQL, num, "?", "?")
+func (m *mySQLTreeStorage) getSubtreeStmt(ctx context.Context, num int) (*sql.Stmt, error) {
+	return m.getStmt(ctx, selectSubtreeSQL, num, "?", "?")
 }
 
-func (m *mySQLTreeStorage) setSubtreeStmt(num int) (*sql.Stmt, error) {
-	return m.getStmt(insertSubtreeMultiSQL, num, "VALUES(?, ?, ?, ?)", "(?, ?, ?, ?)")
+func (m *mySQLTreeStorage) setSubtreeStmt(ctx context.Context, num int) (*sql.Stmt, error) {
+	return m.getStmt(ctx, insertSubtreeMultiSQL, num, "VALUES(?, ?, ?, ?)", "(?, ?, ?, ?)")
 }
 
-func (m *mySQLTreeStorage) beginTreeTx(ctx context.Context, treeID int64, hashSizeBytes int, strataDepths []int, populate storage.PopulateSubtreeFunc, prepare storage.PrepareSubtreeWriteFunc) (treeTX, error) {
+func (m *mySQLTreeStorage) beginTreeTx(ctx context.Context, treeID int64, hashSizeBytes int, subtreeCache cache.SubtreeCache) (treeTX, error) {
 	t, err := m.db.BeginTx(ctx, nil /* opts */)
 	if err != nil {
 		glog.Warningf("Could not start tree TX: %s", err)
@@ -151,7 +152,7 @@ func (m *mySQLTreeStorage) beginTreeTx(ctx context.Context, treeID int64, hashSi
 		ts:            m,
 		treeID:        treeID,
 		hashSizeBytes: hashSizeBytes,
-		subtreeCache:  cache.NewSubtreeCache(strataDepths, populate, prepare),
+		subtreeCache:  subtreeCache,
 		writeRevision: -1,
 	}, nil
 }
@@ -166,8 +167,8 @@ type treeTX struct {
 	writeRevision int64
 }
 
-func (t *treeTX) getSubtree(treeRevision int64, nodeID storage.NodeID) (*storagepb.SubtreeProto, error) {
-	s, err := t.getSubtrees(treeRevision, []storage.NodeID{nodeID})
+func (t *treeTX) getSubtree(ctx context.Context, treeRevision int64, nodeID storage.NodeID) (*storagepb.SubtreeProto, error) {
+	s, err := t.getSubtrees(ctx, treeRevision, []storage.NodeID{nodeID})
 	if err != nil {
 		return nil, err
 	}
@@ -181,16 +182,17 @@ func (t *treeTX) getSubtree(treeRevision int64, nodeID storage.NodeID) (*storage
 	}
 }
 
-func (t *treeTX) getSubtrees(treeRevision int64, nodeIDs []storage.NodeID) ([]*storagepb.SubtreeProto, error) {
+func (t *treeTX) getSubtrees(ctx context.Context, treeRevision int64, nodeIDs []storage.NodeID) ([]*storagepb.SubtreeProto, error) {
+	glog.V(4).Infof("getSubtrees(")
 	if len(nodeIDs) == 0 {
 		return nil, nil
 	}
 
-	tmpl, err := t.ts.getSubtreeStmt(len(nodeIDs))
+	tmpl, err := t.ts.getSubtreeStmt(ctx, len(nodeIDs))
 	if err != nil {
 		return nil, err
 	}
-	stx := t.tx.StmtContext(context.TODO(), tmpl)
+	stx := t.tx.StmtContext(ctx, tmpl)
 	defer stx.Close()
 
 	args := make([]interface{}, 0, len(nodeIDs)+3)
@@ -202,6 +204,7 @@ func (t *treeTX) getSubtrees(treeRevision int64, nodeIDs []storage.NodeID) ([]*s
 		}
 
 		nodeIDBytes := nodeID.Path[:nodeID.PrefixLenBits/8]
+		glog.V(4).Infof("  nodeID: %x", nodeIDBytes)
 
 		args = append(args, interface{}(nodeIDBytes))
 	}
@@ -210,7 +213,7 @@ func (t *treeTX) getSubtrees(treeRevision int64, nodeIDs []storage.NodeID) ([]*s
 	args = append(args, interface{}(treeRevision))
 	args = append(args, interface{}(t.treeID))
 
-	rows, err := stx.QueryContext(context.TODO(), args...)
+	rows, err := stx.QueryContext(ctx, args...)
 	if err != nil {
 		glog.Warningf("Failed to get merkle subtrees: %s", err)
 		return nil, err
@@ -243,6 +246,18 @@ func (t *treeTX) getSubtrees(treeRevision int64, nodeIDs []storage.NodeID) ([]*s
 			subtree.Prefix = []byte{}
 		}
 		ret = append(ret, &subtree)
+
+		if glog.V(4) {
+			glog.Infof("  subtree: NID: %x, prefix: %x, depth: %d",
+				subtreeIDBytes, subtree.Prefix, subtree.Depth)
+			for k, v := range subtree.Leaves {
+				b, err := base64.StdEncoding.DecodeString(k)
+				if err != nil {
+					glog.Errorf("base64.DecodeString(%v): %v", k, err)
+				}
+				glog.Infof("     %x: %x", b, v)
+			}
+		}
 	}
 
 	// The InternalNodes cache is possibly nil here, but the SubtreeCache (which called
@@ -250,7 +265,20 @@ func (t *treeTX) getSubtrees(treeRevision int64, nodeIDs []storage.NodeID) ([]*s
 	return ret, nil
 }
 
-func (t *treeTX) storeSubtrees(subtrees []*storagepb.SubtreeProto) error {
+func (t *treeTX) storeSubtrees(ctx context.Context, subtrees []*storagepb.SubtreeProto) error {
+	if glog.V(4) {
+		glog.Infof("storeSubtrees(")
+		for _, s := range subtrees {
+			glog.Infof("  prefix: %x, depth: %d", s.Prefix, s.Depth)
+			for k, v := range s.Leaves {
+				b, err := base64.StdEncoding.DecodeString(k)
+				if err != nil {
+					glog.Errorf("base64.DecodeString(%v): %v", k, err)
+				}
+				glog.Infof("     %x: %x", b, v)
+			}
+		}
+	}
 	if len(subtrees) == 0 {
 		glog.Warning("attempted to store 0 subtrees...")
 		return nil
@@ -275,14 +303,14 @@ func (t *treeTX) storeSubtrees(subtrees []*storagepb.SubtreeProto) error {
 		args = append(args, t.writeRevision)
 	}
 
-	tmpl, err := t.ts.setSubtreeStmt(len(subtrees))
+	tmpl, err := t.ts.setSubtreeStmt(ctx, len(subtrees))
 	if err != nil {
 		return err
 	}
-	stx := t.tx.StmtContext(context.TODO(), tmpl)
+	stx := t.tx.StmtContext(ctx, tmpl)
 	defer stx.Close()
 
-	r, err := stx.ExecContext(context.TODO(), args...)
+	r, err := stx.ExecContext(ctx, args...)
 	if err != nil {
 		glog.Warningf("Failed to set merkle subtrees: %s", err)
 		return err
@@ -316,35 +344,35 @@ func checkResultOkAndRowCountIs(res sql.Result, err error, count int64) error {
 // It is an error to request tree sizes larger than the currently published tree size.
 // For an inexact tree size this implementation always returns the next largest revision if an
 // exact one does not exist but it isn't required to do so.
-func (t *treeTX) GetTreeRevisionIncludingSize(treeSize int64) (int64, int64, error) {
+func (t *treeTX) GetTreeRevisionIncludingSize(ctx context.Context, treeSize int64) (int64, int64, error) {
 	// Negative size is not sensible and a zero sized tree has no nodes so no revisions
 	if treeSize <= 0 {
 		return 0, 0, fmt.Errorf("invalid tree size: %d", treeSize)
 	}
 
 	var treeRevision, actualTreeSize int64
-	err := t.tx.QueryRowContext(context.TODO(), selectTreeRevisionAtSizeOrLargerSQL, t.treeID, treeSize).Scan(&treeRevision, &actualTreeSize)
+	err := t.tx.QueryRowContext(ctx, selectTreeRevisionAtSizeOrLargerSQL, t.treeID, treeSize).Scan(&treeRevision, &actualTreeSize)
 
 	return treeRevision, actualTreeSize, err
 }
 
 // getSubtreesAtRev returns a GetSubtreesFunc which reads at the passed in rev.
-func (t *treeTX) getSubtreesAtRev(rev int64) cache.GetSubtreesFunc {
+func (t *treeTX) getSubtreesAtRev(ctx context.Context, rev int64) cache.GetSubtreesFunc {
 	return func(ids []storage.NodeID) ([]*storagepb.SubtreeProto, error) {
-		return t.getSubtrees(rev, ids)
+		return t.getSubtrees(ctx, rev, ids)
 	}
 }
 
 // GetMerkleNodes returns the requests nodes at (or below) the passed in treeRevision.
-func (t *treeTX) GetMerkleNodes(treeRevision int64, nodeIDs []storage.NodeID) ([]storage.Node, error) {
-	return t.subtreeCache.GetNodes(nodeIDs, t.getSubtreesAtRev(treeRevision))
+func (t *treeTX) GetMerkleNodes(ctx context.Context, treeRevision int64, nodeIDs []storage.NodeID) ([]storage.Node, error) {
+	return t.subtreeCache.GetNodes(nodeIDs, t.getSubtreesAtRev(ctx, treeRevision))
 }
 
-func (t *treeTX) SetMerkleNodes(nodes []storage.Node) error {
+func (t *treeTX) SetMerkleNodes(ctx context.Context, nodes []storage.Node) error {
 	for _, n := range nodes {
 		err := t.subtreeCache.SetNodeHash(n.NodeID, n.Hash,
 			func(nID storage.NodeID) (*storagepb.SubtreeProto, error) {
-				return t.getSubtree(t.writeRevision, nID)
+				return t.getSubtree(ctx, t.writeRevision, nID)
 			})
 		if err != nil {
 			return err
@@ -356,7 +384,7 @@ func (t *treeTX) SetMerkleNodes(nodes []storage.Node) error {
 func (t *treeTX) Commit() error {
 	if t.writeRevision > -1 {
 		if err := t.subtreeCache.Flush(func(st []*storagepb.SubtreeProto) error {
-			return t.storeSubtrees(st)
+			return t.storeSubtrees(context.TODO(), st)
 		}); err != nil {
 			glog.Warningf("TX commit flush error: %v", err)
 			return err

@@ -20,58 +20,63 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/golang/mock/gomock"
 	"github.com/google/trillian/merkle"
+	"github.com/google/trillian/merkle/maphasher"
+	"github.com/google/trillian/merkle/rfc6962"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/storagepb"
-	stestonly "github.com/google/trillian/storage/testonly"
-	"github.com/google/trillian/testonly"
+
+	"github.com/golang/mock/gomock"
 	"github.com/kylelemons/godebug/pretty"
+
+	stestonly "github.com/google/trillian/storage/testonly"
 )
 
-var splitTestVector = []struct {
-	inPath        []byte
-	inPathLenBits int
-	outPrefix     []byte
-	outSuffixBits int
-	outSuffix     []byte
-}{
-	{[]byte{0x12, 0x34, 0x56, 0x7f}, 32, []byte{0x12, 0x34, 0x56}, 8, []byte{0x7f}},
-	{[]byte{0x12, 0x34, 0x56, 0xff}, 29, []byte{0x12, 0x34, 0x56}, 5, []byte{0xf8}},
-	{[]byte{0x12, 0x34, 0x56, 0xff}, 25, []byte{0x12, 0x34, 0x56}, 1, []byte{0x80}},
-	{[]byte{0x12, 0x34, 0x56, 0x78}, 16, []byte{0x12}, 8, []byte{0x34}},
-	{[]byte{0x12, 0x34, 0x56, 0x78}, 9, []byte{0x12}, 1, []byte{0x00}},
-	{[]byte{0x12, 0x34, 0x56, 0x78}, 8, []byte{}, 8, []byte{0x12}},
-	{[]byte{0x12, 0x34, 0x56, 0x78}, 7, []byte{}, 7, []byte{0x12}},
-	{[]byte{0x12, 0x34, 0x56, 0x78}, 0, []byte{}, 0, []byte{0}},
-	{[]byte{0x70}, 2, []byte{}, 2, []byte{0x40}},
-	{[]byte{0x70}, 3, []byte{}, 3, []byte{0x60}},
-	{[]byte{0x70}, 4, []byte{}, 4, []byte{0x70}},
-	{[]byte{0x70}, 5, []byte{}, 5, []byte{0x70}},
-	{[]byte{0x00, 0x03}, 16, []byte{0x00}, 8, []byte{0x03}},
-	{[]byte{0x00, 0x03}, 15, []byte{0x00}, 7, []byte{0x02}},
-}
+var (
+	defaultLogStrata = []int{8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8}
+	defaultMapStrata = []int{8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 176}
+)
 
-var defaultLogStrata = []int{8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8}
-var defaultMapStrata = []int{8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 176}
+const treeID = int64(0)
 
 func TestSplitNodeID(t *testing.T) {
-	c := NewSubtreeCache(defaultMapStrata, PopulateMapSubtreeNodes(testonly.Hasher), PrepareMapSubtreeWrite())
-	for i, v := range splitTestVector {
-		n := storage.NewNodeIDFromHash(v.inPath)
-		n.PrefixLenBits = v.inPathLenBits
+	c := NewSubtreeCache(defaultMapStrata, populateMapSubtreeNodes(treeID, maphasher.Default), prepareMapSubtreeWrite())
+	for _, tc := range []struct {
+		inPath        []byte
+		inPathLenBits int
+		outPrefix     []byte
+		outSuffixBits int
+		outSuffix     []byte
+	}{
+		{[]byte{0x12, 0x34, 0x56, 0x7f}, 32, []byte{0x12, 0x34, 0x56}, 8, []byte{0x7f}},
+		{[]byte{0x12, 0x34, 0x56, 0xff}, 29, []byte{0x12, 0x34, 0x56}, 5, []byte{0xf8}},
+		{[]byte{0x12, 0x34, 0x56, 0xff}, 25, []byte{0x12, 0x34, 0x56}, 1, []byte{0x80}},
+		{[]byte{0x12, 0x34, 0x56, 0x78}, 16, []byte{0x12}, 8, []byte{0x34}},
+		{[]byte{0x12, 0x34, 0x56, 0x78}, 9, []byte{0x12}, 1, []byte{0x00}},
+		{[]byte{0x12, 0x34, 0x56, 0x78}, 8, []byte{}, 8, []byte{0x12}},
+		{[]byte{0x12, 0x34, 0x56, 0x78}, 7, []byte{}, 7, []byte{0x12}},
+		{[]byte{0x12, 0x34, 0x56, 0x78}, 0, []byte{}, 0, []byte{0}},
+		{[]byte{0x70}, 2, []byte{}, 2, []byte{0x40}},
+		{[]byte{0x70}, 3, []byte{}, 3, []byte{0x60}},
+		{[]byte{0x70}, 4, []byte{}, 4, []byte{0x70}},
+		{[]byte{0x70}, 5, []byte{}, 5, []byte{0x70}},
+		{[]byte{0x00, 0x03}, 16, []byte{0x00}, 8, []byte{0x03}},
+		{[]byte{0x00, 0x03}, 15, []byte{0x00}, 7, []byte{0x02}},
+	} {
+		n := storage.NewNodeIDFromHash(tc.inPath)
+		n.PrefixLenBits = tc.inPathLenBits
 
 		p, s := c.splitNodeID(n)
-		if expected, got := v.outPrefix, p; !bytes.Equal(expected, got) {
-			t.Fatalf("(test %d) Expected prefix %x, got %x", i, expected, got)
+		if got, want := p, tc.outPrefix; !bytes.Equal(got, want) {
+			t.Errorf("splitNodeID(%v): prefix %x, want %x", n, got, want)
+			continue
 		}
-
-		if expected, got := v.outSuffixBits, int(s.bits); expected != got {
-			t.Fatalf("(test %d) Expected suffix num bits %d, got %d", i, expected, got)
+		if got, want := int(s.Bits), tc.outSuffixBits; got != want {
+			t.Errorf("splitNodeID(%v): suffix.Bits %v, want %v", n, got, want)
+			continue
 		}
-
-		if expected, got := v.outSuffix, s.path; !bytes.Equal(expected, got) {
-			t.Fatalf("(test %d) Expected suffix path of %x, got %x", i, expected, got)
+		if got, want := s.Path, tc.outSuffix; !bytes.Equal(got, want) {
+			t.Errorf("splitNodeID(%v): suffix.Path %x, want %x", n, got, want)
 		}
 	}
 }
@@ -81,7 +86,7 @@ func TestCacheFillOnlyReadsSubtrees(t *testing.T) {
 	defer mockCtrl.Finish()
 
 	m := NewMockNodeStorage(mockCtrl)
-	c := NewSubtreeCache(defaultLogStrata, PopulateMapSubtreeNodes(testonly.Hasher), PrepareMapSubtreeWrite())
+	c := NewSubtreeCache(defaultLogStrata, populateMapSubtreeNodes(treeID, maphasher.Default), prepareMapSubtreeWrite())
 
 	nodeID := storage.NewNodeIDFromHash([]byte("1234"))
 	// When we loop around asking for all 0..32 bit prefix lengths of the above
@@ -110,7 +115,7 @@ func TestCacheGetNodesReadsSubtrees(t *testing.T) {
 	defer mockCtrl.Finish()
 
 	m := NewMockNodeStorage(mockCtrl)
-	c := NewSubtreeCache(defaultLogStrata, PopulateMapSubtreeNodes(testonly.Hasher), PrepareMapSubtreeWrite())
+	c := NewSubtreeCache(defaultLogStrata, populateMapSubtreeNodes(treeID, maphasher.Default), prepareMapSubtreeWrite())
 
 	nodeIDs := []storage.NodeID{
 		storage.NewNodeIDFromHash([]byte("1234")),
@@ -154,7 +159,7 @@ func TestCacheGetNodesReadsSubtrees(t *testing.T) {
 	}
 }
 
-func noFetch(id storage.NodeID) (*storagepb.SubtreeProto, error) {
+func noFetch(storage.NodeID) (*storagepb.SubtreeProto, error) {
 	return nil, errors.New("not supposed to read anything")
 }
 
@@ -163,7 +168,7 @@ func TestCacheFlush(t *testing.T) {
 	defer mockCtrl.Finish()
 
 	m := NewMockNodeStorage(mockCtrl)
-	c := NewSubtreeCache(defaultMapStrata, PopulateMapSubtreeNodes(testonly.Hasher), PrepareMapSubtreeWrite())
+	c := NewSubtreeCache(defaultMapStrata, populateMapSubtreeNodes(treeID, maphasher.Default), prepareMapSubtreeWrite())
 
 	h := "0123456789abcdef0123456789abcdef"
 	nodeID := storage.NewNodeIDFromHash([]byte(h))
@@ -240,16 +245,9 @@ func TestCacheFlush(t *testing.T) {
 	}
 }
 
-func TestSuffixSerializeFormat(t *testing.T) {
-	s := Suffix{5, []byte{0xae}}
-	if got, want := s.serialize(), "Ba4="; got != want {
-		t.Fatalf("Got serialized suffix of %s, expected %s", got, want)
-	}
-}
-
 func TestRepopulateLogSubtree(t *testing.T) {
-	populateTheThing := PopulateLogSubtreeNodes(testonly.Hasher)
-	cmt := merkle.NewCompactMerkleTree(testonly.Hasher)
+	populateTheThing := populateLogSubtreeNodes(rfc6962.DefaultHasher)
+	cmt := merkle.NewCompactMerkleTree(rfc6962.DefaultHasher)
 	cmtStorage := storagepb.SubtreeProto{
 		Leaves:        make(map[string][]byte),
 		InternalNodes: make(map[string][]byte),
@@ -259,14 +257,17 @@ func TestRepopulateLogSubtree(t *testing.T) {
 		Leaves: make(map[string][]byte),
 		Depth:  int32(defaultLogStrata[0]),
 	}
-	c := NewSubtreeCache(defaultLogStrata, PopulateLogSubtreeNodes(testonly.Hasher), PrepareLogSubtreeWrite())
+	c := NewSubtreeCache(defaultLogStrata, populateLogSubtreeNodes(rfc6962.DefaultHasher), prepareLogSubtreeWrite())
 	for numLeaves := int64(1); numLeaves <= 256; numLeaves++ {
 		// clear internal nodes
 		s.InternalNodes = make(map[string][]byte)
 
 		leaf := []byte(fmt.Sprintf("this is leaf %d", numLeaves))
-		leafHash := testonly.Hasher.HashLeaf(leaf)
-		_, err := cmt.AddLeafHash(leafHash, func(depth int, index int64, h []byte) error {
+		leafHash, err := rfc6962.DefaultHasher.HashLeaf(leaf)
+		if err != nil {
+			t.Fatalf("HashLeaf(%v): %v", leaf, err)
+		}
+		_, err = cmt.AddLeafHash(leafHash, func(depth int, index int64, h []byte) error {
 			n, err := storage.NewNodeIDForTreeCoords(int64(depth), index, 8)
 			if err != nil {
 				return fmt.Errorf("failed to create nodeID for cmt tree: %v", err)
@@ -274,7 +275,7 @@ func TestRepopulateLogSubtree(t *testing.T) {
 			// Don't store leaves or the subtree root in InternalNodes
 			if depth > 0 && depth < 8 {
 				_, sfx := c.splitNodeID(n)
-				cmtStorage.InternalNodes[sfx.serialize()] = h
+				cmtStorage.InternalNodes[sfx.String()] = h
 			}
 			return nil
 		})
@@ -282,17 +283,16 @@ func TestRepopulateLogSubtree(t *testing.T) {
 			t.Fatalf("merkle tree update failed: %v", err)
 		}
 
-		sfx, err := makeSuffixKey(8, numLeaves-1)
-		if err != nil {
-			t.Fatalf("failed to create suffix key: %v", err)
-		}
-		s.Leaves[sfx] = leafHash
+		nodeID := storage.NewNodeIDFromPrefix(s.Prefix, logStrataDepth, numLeaves-1, logStrataDepth, maxLogDepth)
+		_, sfx := nodeID.Split(len(s.Prefix), int(s.Depth))
+		sfxKey := sfx.String()
+		s.Leaves[sfxKey] = leafHash
 		if numLeaves == 1<<uint(defaultLogStrata[0]) {
 			s.InternalNodeCount = uint32(len(cmtStorage.InternalNodes))
 		} else {
 			s.InternalNodeCount = 0
 		}
-		cmtStorage.Leaves[sfx] = leafHash
+		cmtStorage.Leaves[sfxKey] = leafHash
 
 		if err := populateTheThing(&s); err != nil {
 			t.Fatalf("failed populate subtree: %v", err)
@@ -317,7 +317,7 @@ func TestPrefixLengths(t *testing.T) {
 	strata := []int{8, 8, 16, 32, 64, 128}
 	stratumInfo := []stratumInfo{{0, 8}, {1, 8}, {2, 16}, {2, 16}, {4, 32}, {4, 32}, {4, 32}, {4, 32}, {8, 64}, {8, 64}, {8, 64}, {8, 64}, {8, 64}, {8, 64}, {8, 64}, {8, 64}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}, {16, 128}}
 
-	c := NewSubtreeCache(strata, PopulateMapSubtreeNodes(testonly.Hasher), PrepareMapSubtreeWrite())
+	c := NewSubtreeCache(strata, populateMapSubtreeNodes(treeID, maphasher.Default), prepareMapSubtreeWrite())
 
 	if diff := pretty.Compare(c.stratumInfo, stratumInfo); diff != "" {
 		t.Fatalf("prefixLengths diff:\n%v", diff)
@@ -325,7 +325,7 @@ func TestPrefixLengths(t *testing.T) {
 }
 
 func TestGetStratumInfo(t *testing.T) {
-	c := NewSubtreeCache(defaultMapStrata, PopulateMapSubtreeNodes(testonly.Hasher), PrepareMapSubtreeWrite())
+	c := NewSubtreeCache(defaultMapStrata, populateMapSubtreeNodes(treeID, maphasher.Default), prepareMapSubtreeWrite())
 	testVec := []struct {
 		depth int
 		info  stratumInfo

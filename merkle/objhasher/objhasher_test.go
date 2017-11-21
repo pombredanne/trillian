@@ -20,11 +20,14 @@ import (
 	"encoding/hex"
 	"testing"
 
+	"github.com/google/trillian/merkle/maphasher"
 	"github.com/google/trillian/merkle/rfc6962"
 )
 
+const treeID = int64(0)
+
 func TestLeafHash(t *testing.T) {
-	h := ObjectHasher
+	h := NewLogHasher(rfc6962.New(crypto.SHA256))
 
 	for _, tc := range []struct {
 		json []byte
@@ -41,7 +44,10 @@ func TestLeafHash(t *testing.T) {
 			want: "ddd65f1f7568269a30df7cafc26044537dc2f02a1a0d830da61762fc3e687057",
 		},
 	} {
-		leaf := h.HashLeaf(tc.json)
+		leaf, err := h.HashLeaf(tc.json)
+		if err != nil {
+			t.Errorf("HashLeaf(%v): %v", tc.json, err)
+		}
 		if got := hex.EncodeToString(leaf); got != tc.want {
 			t.Errorf("HashLeaf(%v): \n%v, want \n%v", tc.json, got, tc.want)
 		}
@@ -49,17 +55,17 @@ func TestLeafHash(t *testing.T) {
 }
 
 func TestHashEmpty(t *testing.T) {
-	h := ObjectHasher
-	rfc := rfc6962.TreeHasher{Hash: crypto.SHA256}
+	h := NewMapHasher(maphasher.New(crypto.SHA256))
+	rfc := maphasher.New(crypto.SHA256)
 
-	if got, want := h.HashEmpty(), rfc.HashEmpty(); !bytes.Equal(got, want) {
+	if got, want := h.HashEmpty(treeID, nil, 0), rfc.HashEmpty(treeID, nil, 0); !bytes.Equal(got, want) {
 		t.Errorf("HashEmpty():\n%x, want\n%x", got, want)
 	}
 }
 
 func TestHashChildren(t *testing.T) {
-	h := ObjectHasher
-	rfc := rfc6962.TreeHasher{Hash: crypto.SHA256}
+	h := NewMapHasher(maphasher.New(crypto.SHA256))
+	rfc := maphasher.New(crypto.SHA256)
 
 	for _, tc := range []struct {
 		r, l []byte

@@ -23,10 +23,16 @@ import (
 	"time"
 
 	"github.com/golang/mock/gomock"
+	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
+	tcrypto "github.com/google/trillian/crypto"
 	"github.com/google/trillian/crypto/keys"
+	"github.com/google/trillian/crypto/keys/pem"
 	"github.com/google/trillian/crypto/sigpb"
 	"github.com/google/trillian/extension"
+	"github.com/google/trillian/merkle/rfc6962"
+	"github.com/google/trillian/quota"
 	"github.com/google/trillian/storage"
 	stestonly "github.com/google/trillian/storage/testonly"
 	"github.com/google/trillian/testonly"
@@ -39,8 +45,9 @@ var fakeTimeSource = util.NewFakeTimeSource(fakeTime)
 
 // We use a size zero tree for testing, Merkle tree state restore is tested elsewhere
 var testLogID1 = int64(1)
+var leaf0Hash, _ = rfc6962.DefaultHasher.HashLeaf([]byte{})
 var testLeaf0 = &trillian.LogLeaf{
-	MerkleLeafHash: testonly.Hasher.HashLeaf([]byte{}),
+	MerkleLeafHash: leaf0Hash,
 	LeafValue:      nil,
 	ExtraData:      nil,
 	LeafIndex:      0,
@@ -61,7 +68,7 @@ var testRoot0 = trillian.SignedLogRoot{
 		SignatureAlgorithm: sigpb.DigitallySigned_ECDSA,
 	},
 }
-var updatedNodes0 = []storage.Node{{NodeID: storage.NodeID{Path: []uint8{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, PrefixLenBits: 64, PathLenBits: 64}, Hash: testonly.MustDecodeBase64("bjQLnP+zepicpUTmu3gKLHiQHT+zNzh2hRGjBhevoB0="), NodeRevision: 1}}
+var updatedNodes0 = []storage.Node{{NodeID: storage.NodeID{Path: []uint8{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, PrefixLenBits: 64}, Hash: testonly.MustDecodeBase64("bjQLnP+zepicpUTmu3gKLHiQHT+zNzh2hRGjBhevoB0="), NodeRevision: 1}}
 var updatedRoot = trillian.SignedLogRoot{
 	LogId:          testLogID1,
 	TimestampNanos: fakeTime.UnixNano(),
@@ -79,26 +86,14 @@ var zeroDuration = 0 * time.Second
 
 const writeRev = int64(24)
 
-type signerFactory struct {
-	signers map[int64]crypto.Signer
-}
-
-func (f *signerFactory) NewSigner(ctx context.Context, tree *trillian.Tree) (crypto.Signer, error) {
-	signer := f.signers[tree.GetTreeId()]
-	if signer == nil {
-		return nil, fmt.Errorf("no signer for tree %v", tree.GetTreeId())
-	}
-	return signer, nil
-}
-
 // newSignerWithFixedSig returns a fake signer that always returns the specified signature.
 func newSignerWithFixedSig(sig *sigpb.DigitallySigned) (crypto.Signer, error) {
-	key, err := keys.NewFromPublicPEM(testonly.DemoPublicKey)
+	key, err := pem.UnmarshalPublicKey(testonly.DemoPublicKey)
 	if err != nil {
 		return nil, err
 	}
 
-	if keys.SignatureAlgorithm(key) != sig.GetSignatureAlgorithm() {
+	if tcrypto.SignatureAlgorithm(key) != sig.GetSignatureAlgorithm() {
 		return nil, errors.New("signature algorithm does not match demo public key")
 	}
 
@@ -116,10 +111,18 @@ func TestSequencerManagerSingleLogNoLeaves(t *testing.T) {
 	mockStorage := storage.NewMockLogStorage(mockCtrl)
 	mockTx := storage.NewMockLogTreeTX(mockCtrl)
 
+	var keyProto ptypes.DynamicAny
+	if err := ptypes.UnmarshalAny(stestonly.LogTree.PrivateKey, &keyProto); err != nil {
+		t.Fatalf("Failed to unmarshal stestonly.LogTree.PrivateKey: %v", err)
+	}
+
 	signer, err := newSignerWithFixedSig(updatedRoot.Signature)
 	if err != nil {
-		t.Fatalf("Failed to create test signer (%v)", err)
+		t.Fatalf("Failed to create fake signer: %v", err)
 	}
+
+	keys.RegisterHandler(fakeKeyProtoHandler(keyProto.Message, signer, nil))
+	defer keys.UnregisterHandler(keyProto.Message)
 
 	mockStorage.EXPECT().BeginForTree(gomock.Any(), logID).Return(mockTx, nil)
 	mockTx.EXPECT().Commit().Return(nil)
@@ -136,13 +139,10 @@ func TestSequencerManagerSingleLogNoLeaves(t *testing.T) {
 	registry := extension.Registry{
 		AdminStorage: mockAdmin,
 		LogStorage:   mockStorage,
-		SignerFactory: &signerFactory{
-			signers: map[int64]crypto.Signer{logID: signer},
-		},
+		QuotaManager: quota.Noop(),
 	}
 
 	sm := NewSequencerManager(registry, zeroDuration)
-
 	sm.ExecutePass(ctx, logID, createTestInfo(registry))
 }
 
@@ -156,6 +156,25 @@ func TestSequencerManagerCachesSigners(t *testing.T) {
 	mockAdminTx := storage.NewMockReadOnlyAdminTX(mockCtrl)
 	mockStorage := storage.NewMockLogStorage(mockCtrl)
 	mockTx := storage.NewMockLogTreeTX(mockCtrl)
+
+	var keyProto ptypes.DynamicAny
+	if err := ptypes.UnmarshalAny(stestonly.LogTree.PrivateKey, &keyProto); err != nil {
+		t.Fatalf("Failed to unmarshal stestonly.LogTree.PrivateKey: %v", err)
+	}
+
+	signer, err := newSignerWithFixedSig(updatedRoot.Signature)
+	if err != nil {
+		t.Fatalf("Failed to create fake signer: %v", err)
+	}
+
+	keys.RegisterHandler(fakeKeyProtoHandler(keyProto.Message, signer, nil))
+
+	registry := extension.Registry{
+		AdminStorage: mockAdmin,
+		LogStorage:   mockStorage,
+		QuotaManager: quota.Noop(),
+	}
+	sm := NewSequencerManager(registry, zeroDuration)
 
 	// Expect two sequencing passes.
 	for i := 0; i < 2; i++ {
@@ -174,34 +193,16 @@ func TestSequencerManagerCachesSigners(t *testing.T) {
 			mockTx.EXPECT().Commit().Return(nil),
 			mockTx.EXPECT().Close().Return(nil),
 		)
-	}
 
-	signer, err := newSignerWithFixedSig(updatedRoot.Signature)
-	if err != nil {
-		t.Fatalf("Failed to create test signer (%v)", err)
-	}
+		if _, err := sm.ExecutePass(ctx, logID, createTestInfo(registry)); err != nil {
+			t.Fatal(err)
+		}
 
-	sf := signerFactory{
-		signers: map[int64]crypto.Signer{logID: signer},
-	}
-
-	registry := extension.Registry{
-		AdminStorage:  mockAdmin,
-		LogStorage:    mockStorage,
-		SignerFactory: &sf,
-	}
-
-	sm := NewSequencerManager(registry, zeroDuration)
-
-	// Execute two passes. A cached signer should be used for the 2nd pass.
-	if _, err := sm.ExecutePass(ctx, logID, createTestInfo(registry)); err != nil {
-		t.Fatal(err)
-	}
-
-	delete(sf.signers, logID)
-
-	if _, err := sm.ExecutePass(ctx, logID, createTestInfo(registry)); err != nil {
-		t.Fatal(err)
+		// Remove the ProtoHandler added earlier in the test.
+		// This guarantees that no further calls to keys.NewSigner() will succeed.
+		// This tests that the signer obtained by SequencerManager during the first sequencing
+		// pass is cached and re-used for the second pass.
+		keys.UnregisterHandler(keyProto.Message)
 	}
 }
 
@@ -216,6 +217,14 @@ func TestSequencerManagerSingleLogNoSigner(t *testing.T) {
 	mockAdminTx := storage.NewMockReadOnlyAdminTX(mockCtrl)
 	mockStorage := storage.NewMockLogStorage(mockCtrl)
 
+	var keyProto ptypes.DynamicAny
+	if err := ptypes.UnmarshalAny(stestonly.LogTree.PrivateKey, &keyProto); err != nil {
+		t.Fatalf("Failed to unmarshal stestonly.LogTree.PrivateKey: %v", err)
+	}
+
+	keys.RegisterHandler(fakeKeyProtoHandler(keyProto.Message, nil, errors.New("no signer for this tree")))
+	defer keys.UnregisterHandler(keyProto.Message)
+
 	gomock.InOrder(
 		mockAdmin.EXPECT().Snapshot(gomock.Any()).Return(mockAdminTx, nil),
 		mockAdminTx.EXPECT().GetTree(gomock.Any(), logID).Return(stestonly.LogTree, nil),
@@ -226,15 +235,12 @@ func TestSequencerManagerSingleLogNoSigner(t *testing.T) {
 	registry := extension.Registry{
 		AdminStorage: mockAdmin,
 		LogStorage:   mockStorage,
-		SignerFactory: &signerFactory{
-			// No signers provided, so that an error is returned.
-			signers: map[int64]crypto.Signer{},
-		},
+		QuotaManager: quota.Noop(),
 	}
 
 	sm := NewSequencerManager(registry, zeroDuration)
 	if _, err := sm.ExecutePass(ctx, logID, createTestInfo(registry)); err == nil {
-		t.Fatalf("ExecutePass() = (_, nil), want err")
+		t.Fatal("ExecutePass() = (_, nil), want err")
 	}
 }
 
@@ -249,10 +255,18 @@ func TestSequencerManagerSingleLogOneLeaf(t *testing.T) {
 	mockStorage := storage.NewMockLogStorage(mockCtrl)
 	mockTx := storage.NewMockLogTreeTX(mockCtrl)
 
+	var keyProto ptypes.DynamicAny
+	if err := ptypes.UnmarshalAny(stestonly.LogTree.PrivateKey, &keyProto); err != nil {
+		t.Fatalf("Failed to unmarshal stestonly.LogTree.PrivateKey: %v", err)
+	}
+
 	signer, err := newSignerWithFixedSig(updatedRoot.Signature)
 	if err != nil {
-		t.Fatalf("Failed to create test signer (%v)", err)
+		t.Fatalf("Failed to create fake signer: %v", err)
 	}
+
+	keys.RegisterHandler(fakeKeyProtoHandler(keyProto.Message, signer, nil))
+	defer keys.UnregisterHandler(keyProto.Message)
 
 	// Set up enough mockery to be able to sequence. We don't test all the error paths
 	// through sequencer as other tests cover this
@@ -262,7 +276,7 @@ func TestSequencerManagerSingleLogOneLeaf(t *testing.T) {
 	mockTx.EXPECT().DequeueLeaves(gomock.Any(), 50, fakeTime).Return([]*trillian.LogLeaf{testLeaf0}, nil)
 	mockTx.EXPECT().LatestSignedLogRoot(gomock.Any()).Return(testRoot0, nil)
 	mockTx.EXPECT().UpdateSequencedLeaves(gomock.Any(), []*trillian.LogLeaf{testLeaf0Updated}).Return(nil)
-	mockTx.EXPECT().SetMerkleNodes(updatedNodes0).Return(nil)
+	mockTx.EXPECT().SetMerkleNodes(gomock.Any(), updatedNodes0).Return(nil)
 	mockTx.EXPECT().StoreSignedLogRoot(gomock.Any(), updatedRoot).Return(nil)
 	mockStorage.EXPECT().BeginForTree(gomock.Any(), logID).Return(mockTx, nil)
 
@@ -274,13 +288,10 @@ func TestSequencerManagerSingleLogOneLeaf(t *testing.T) {
 	registry := extension.Registry{
 		AdminStorage: mockAdmin,
 		LogStorage:   mockStorage,
-		SignerFactory: &signerFactory{
-			signers: map[int64]crypto.Signer{logID: signer},
-		},
+		QuotaManager: quota.Noop(),
 	}
 
 	sm := NewSequencerManager(registry, zeroDuration)
-
 	sm.ExecutePass(ctx, logID, createTestInfo(registry))
 }
 
@@ -295,10 +306,18 @@ func TestSequencerManagerGuardWindow(t *testing.T) {
 	mockStorage := storage.NewMockLogStorage(mockCtrl)
 	mockTx := storage.NewMockLogTreeTX(mockCtrl)
 
+	var keyProto ptypes.DynamicAny
+	if err := ptypes.UnmarshalAny(stestonly.LogTree.PrivateKey, &keyProto); err != nil {
+		t.Fatalf("Failed to unmarshal stestonly.LogTree.PrivateKey: %v", err)
+	}
+
 	signer, err := newSignerWithFixedSig(updatedRoot.Signature)
 	if err != nil {
-		t.Fatalf("Failed to create test signer (%v)", err)
+		t.Fatalf("Failed to create fake signer: %v", err)
 	}
+
+	keys.RegisterHandler(fakeKeyProtoHandler(keyProto.Message, signer, nil))
+	defer keys.UnregisterHandler(keyProto.Message)
 
 	mockStorage.EXPECT().BeginForTree(gomock.Any(), logID).Return(mockTx, nil)
 	mockTx.EXPECT().Commit().Return(nil)
@@ -316,13 +335,10 @@ func TestSequencerManagerGuardWindow(t *testing.T) {
 	registry := extension.Registry{
 		AdminStorage: mockAdmin,
 		LogStorage:   mockStorage,
-		SignerFactory: &signerFactory{
-			signers: map[int64]crypto.Signer{logID: signer},
-		},
+		QuotaManager: quota.Noop(),
 	}
 
 	sm := NewSequencerManager(registry, time.Second*5)
-
 	sm.ExecutePass(ctx, logID, createTestInfo(registry))
 }
 
@@ -333,5 +349,14 @@ func createTestInfo(registry extension.Registry) *LogOperationInfo {
 		BatchSize:   50,
 		RunInterval: time.Second,
 		TimeSource:  fakeTimeSource,
+	}
+}
+
+func fakeKeyProtoHandler(wantKeyProto proto.Message, signer crypto.Signer, err error) (proto.Message, keys.ProtoHandler) {
+	return wantKeyProto, func(ctx context.Context, gotKeyProto proto.Message) (crypto.Signer, error) {
+		if proto.Equal(wantKeyProto, gotKeyProto) {
+			return signer, err
+		}
+		return nil, fmt.Errorf("fakeKeyProtoHandler: got %s, want %s", gotKeyProto, wantKeyProto)
 	}
 }

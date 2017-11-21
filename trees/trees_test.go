@@ -22,19 +22,20 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/golang/mock/gomock"
 	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
 	"github.com/google/trillian"
-	tcrypto "github.com/google/trillian/crypto"
 	"github.com/google/trillian/crypto/keys"
 	"github.com/google/trillian/crypto/sigpb"
-	"github.com/google/trillian/merkle"
-	"github.com/google/trillian/merkle/rfc6962"
 	"github.com/google/trillian/storage"
 	"github.com/google/trillian/storage/testonly"
 	"github.com/kylelemons/godebug/pretty"
+
+	tcrypto "github.com/google/trillian/crypto"
 )
 
 func TestFromContext(t *testing.T) {
@@ -72,12 +73,8 @@ func TestGetTree(t *testing.T) {
 	frozenTree.TreeState = trillian.TreeState_FROZEN
 
 	softDeletedTree := *testonly.LogTree
-	softDeletedTree.TreeId = 4
-	softDeletedTree.TreeState = trillian.TreeState_SOFT_DELETED
-
-	hardDeletedTree := *testonly.LogTree
-	hardDeletedTree.TreeId = 5
-	hardDeletedTree.TreeState = trillian.TreeState_HARD_DELETED
+	softDeletedTree.Deleted = true
+	softDeletedTree.DeleteTime = ptypes.TimestampNow()
 
 	tests := []struct {
 		desc                           string
@@ -134,14 +131,7 @@ func TestGetTree(t *testing.T) {
 			treeID:      softDeletedTree.TreeId,
 			opts:        GetOpts{TreeType: trillian.TreeType_LOG},
 			storageTree: &softDeletedTree,
-			wantErr:     true,
-		},
-		{
-			desc:        "hardDeleted",
-			treeID:      hardDeletedTree.TreeId,
-			opts:        GetOpts{TreeType: trillian.TreeType_LOG},
-			storageTree: &hardDeletedTree,
-			wantErr:     true,
+			wantErr:     true, // Deleted = true makes the tree "invisible" for most RPCs
 		},
 		{
 			desc:     "treeInCtx",
@@ -237,41 +227,6 @@ func TestHash(t *testing.T) {
 	}
 }
 
-func TestHasher(t *testing.T) {
-	tests := []struct {
-		strategy   trillian.HashStrategy
-		wantHasher merkle.TreeHasher
-		wantErr    bool
-	}{
-		{
-			strategy: trillian.HashStrategy_UNKNOWN_HASH_STRATEGY,
-			wantErr:  true,
-		},
-		{
-			strategy:   trillian.HashStrategy_RFC_6962,
-			wantHasher: rfc6962.TreeHasher{Hash: crypto.SHA256},
-		},
-	}
-
-	for _, test := range tests {
-		tree := *testonly.LogTree
-		tree.HashAlgorithm = sigpb.DigitallySigned_SHA256
-		tree.HashStrategy = test.strategy
-
-		hasher, err := Hasher(&tree)
-		if hasErr := err != nil; hasErr != test.wantErr {
-			t.Errorf("Hasher(%s) = (_, %q), wantErr = %v", test.strategy, err, test.wantErr)
-			continue
-		} else if hasErr {
-			continue
-		}
-
-		if hasher != test.wantHasher {
-			t.Errorf("Hasher(%s) = (%v, nil), want = (%v, nil)", test.strategy, hasher, test.wantHasher)
-		}
-	}
-}
-
 func TestSigner(t *testing.T) {
 	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -287,11 +242,11 @@ func TestSigner(t *testing.T) {
 	defer ctrl.Finish()
 
 	tests := []struct {
-		desc             string
-		sigAlgo          sigpb.DigitallySigned_SignatureAlgorithm
-		signer           crypto.Signer
-		signerFactoryErr error
-		wantErr          bool
+		desc         string
+		sigAlgo      sigpb.DigitallySigned_SignatureAlgorithm
+		signer       crypto.Signer
+		newSignerErr error
+		wantErr      bool
 	}{
 		{
 			desc:    "anonymous",
@@ -321,10 +276,10 @@ func TestSigner(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			desc:             "signerFactoryErr",
-			sigAlgo:          sigpb.DigitallySigned_ECDSA,
-			signerFactoryErr: errors.New("signer factory error"),
-			wantErr:          true,
+			desc:         "newSignerErr",
+			sigAlgo:      sigpb.DigitallySigned_ECDSA,
+			newSignerErr: errors.New("NewSigner() error"),
+			wantErr:      true,
 		},
 	}
 
@@ -332,13 +287,23 @@ func TestSigner(t *testing.T) {
 	for _, test := range tests {
 		tree := *testonly.LogTree
 		tree.HashAlgorithm = sigpb.DigitallySigned_SHA256
-		tree.HashStrategy = trillian.HashStrategy_RFC_6962
+		tree.HashStrategy = trillian.HashStrategy_RFC6962_SHA256
 		tree.SignatureAlgorithm = test.sigAlgo
 
-		sf := keys.NewMockSignerFactory(ctrl)
-		sf.EXPECT().NewSigner(ctx, &tree).MaxTimes(1).Return(test.signer, test.signerFactoryErr)
+		var wantKeyProto ptypes.DynamicAny
+		if err := ptypes.UnmarshalAny(tree.PrivateKey, &wantKeyProto); err != nil {
+			t.Errorf("%v: failed to unmarshal tree.PrivateKey: %v", test.desc, err)
+		}
 
-		signer, err := Signer(ctx, sf, &tree)
+		keys.RegisterHandler(wantKeyProto.Message, func(ctx context.Context, gotKeyProto proto.Message) (crypto.Signer, error) {
+			if !proto.Equal(gotKeyProto, wantKeyProto.Message) {
+				return nil, fmt.Errorf("NewSigner(_, %#v) called, want NewSigner(_, %#v)", gotKeyProto, wantKeyProto.Message)
+			}
+			return test.signer, test.newSignerErr
+		})
+		defer keys.UnregisterHandler(wantKeyProto.Message)
+
+		signer, err := Signer(ctx, &tree)
 		if hasErr := err != nil; hasErr != test.wantErr {
 			t.Errorf("%v: Signer(_, %s) = (_, %q), wantErr = %v", test.desc, test.sigAlgo, err, test.wantErr)
 			continue

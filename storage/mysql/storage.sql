@@ -4,25 +4,24 @@
 -- Tree stuff here
 -- ---------------------------------------------
 
--- Enable strict mode, so invalid data on inserts/updates is treated as error
--- instead of warning.
--- https://dev.mysql.com/doc/refman/5.7/en/sql-mode.html#sql-mode-strict
-SET GLOBAL sql_mode = 'STRICT_ALL_TABLES';
-
 -- Tree parameters should not be changed after creation. Doing so can
 -- render the data in the tree unusable or inconsistent.
 CREATE TABLE IF NOT EXISTS Trees(
   TreeId                BIGINT NOT NULL,
-  TreeState             ENUM('ACTIVE', 'FROZEN', 'SOFT_DELETED', 'HARD_DELETED') NOT NULL,
+  TreeState             ENUM('ACTIVE', 'FROZEN') NOT NULL,
   TreeType              ENUM('LOG', 'MAP') NOT NULL,
-  HashStrategy          ENUM('RFC_6962') NOT NULL,
+  HashStrategy          ENUM('RFC6962_SHA256', 'TEST_MAP_HASHER', 'OBJECT_RFC6962_SHA256', 'CONIKS_SHA512_256') NOT NULL,
   HashAlgorithm         ENUM('SHA256') NOT NULL,
   SignatureAlgorithm    ENUM('ECDSA', 'RSA') NOT NULL,
   DisplayName           VARCHAR(20),
   Description           VARCHAR(200),
   CreateTimeMillis      BIGINT NOT NULL,
   UpdateTimeMillis      BIGINT NOT NULL,
-  PrivateKey            BLOB NOT NULL,
+  MaxRootDurationMillis BIGINT NOT NULL,
+  PrivateKey            MEDIUMBLOB NOT NULL,
+  PublicKey             MEDIUMBLOB NOT NULL,
+  Deleted               BOOLEAN,
+  DeleteTimeMillis      BIGINT,
   PRIMARY KEY(TreeId)
 );
 
@@ -34,7 +33,7 @@ CREATE TABLE IF NOT EXISTS TreeControl(
   SequencingEnabled       BOOLEAN NOT NULL,
   SequenceIntervalSeconds INTEGER NOT NULL,
   PRIMARY KEY(TreeId),
-  FOREIGN KEY(TreeId) REFERENCES Trees(TreeId)
+  FOREIGN KEY(TreeId) REFERENCES Trees(TreeId) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS Subtree(
@@ -53,13 +52,14 @@ CREATE TABLE IF NOT EXISTS TreeHead(
   TreeHeadTimestamp    BIGINT,
   TreeSize             BIGINT,
   RootHash             VARBINARY(255) NOT NULL,
-  RootSignature        VARBINARY(255) NOT NULL,
+  RootSignature        VARBINARY(1024) NOT NULL,
   TreeRevision         BIGINT,
   PRIMARY KEY(TreeId, TreeHeadTimestamp),
-  UNIQUE INDEX TreeRevisionIdx(TreeId, TreeRevision),
   FOREIGN KEY(TreeId) REFERENCES Trees(TreeId) ON DELETE CASCADE
 );
 
+CREATE UNIQUE INDEX TreeHeadRevisionIdx
+  ON TreeHead(TreeId, TreeRevision);
 
 -- ---------------------------------------------
 -- Log specific stuff here
@@ -79,10 +79,10 @@ CREATE TABLE IF NOT EXISTS LeafData(
   LeafIdentityHash     VARBINARY(255) NOT NULL,
   -- This is the data stored in the leaf for example in CT it contains a DER encoded
   -- X.509 certificate but is application dependent
-  LeafValue            BLOB NOT NULL,
+  LeafValue            LONGBLOB NOT NULL,
   -- This is extra data that the application can associate with the leaf should it wish to.
   -- This data is not included in signing and hashing.
-  ExtraData            BLOB,
+  ExtraData            LONGBLOB,
   PRIMARY KEY(TreeId, LeafIdentityHash),
   FOREIGN KEY(TreeId) REFERENCES Trees(TreeId) ON DELETE CASCADE
 );
@@ -110,19 +110,22 @@ CREATE TABLE IF NOT EXISTS SequencedLeafData(
 
 CREATE TABLE IF NOT EXISTS Unsequenced(
   TreeId               BIGINT NOT NULL,
-  -- This is a personality specific has of some subset of the leaf data.
+  -- The bucket field is to allow the use of time based ring bucketed schemes if desired. If
+  -- unused this should be set to zero for all entries.
+  Bucket               INTEGER NOT NULL,
+  -- This is a personality specific hash of some subset of the leaf data.
   -- It's only purpose is to allow Trillian to identify duplicate entries in
   -- the context of the personality.
   LeafIdentityHash     VARBINARY(255) NOT NULL,
   -- This is a MerkleLeafHash as defined by the treehasher that the log uses. For example for
   -- CT this hash will include the leaf prefix byte as well as the leaf data.
   MerkleLeafHash       VARBINARY(255) NOT NULL,
-  -- SHA256("queueId"|TreeId|leafValueHash)
-  -- We want this to be unique per entry per log, but queryable by FEs so that
-  -- we can try to stomp dupe submissions.
-  MessageId            BINARY(32) NOT NULL,
   QueueTimestampNanos  BIGINT NOT NULL,
-  PRIMARY KEY (TreeId, LeafIdentityHash, MessageId)
+  -- This is a SHA256 hash of the TreeID, LeafIdentityHash and QueueTimestampNanos. It is used
+  -- for batched deletes from the table when trillian_log_server and trillian_log_signer are
+  -- built with the batched_queue tag.
+  QueueID VARBINARY(32) DEFAULT NULL UNIQUE,
+  PRIMARY KEY (TreeId, Bucket, QueueTimestampNanos, LeafIdentityHash)
 );
 
 
@@ -136,7 +139,7 @@ CREATE TABLE IF NOT EXISTS MapLeaf(
   -- MapRevision is stored negated to invert ordering in the primary key index
   -- st. more recent revisions come first.
   MapRevision           BIGINT NOT NULL,
-  LeafValue             BLOB NOT NULL,
+  LeafValue             LONGBLOB NOT NULL,
   PRIMARY KEY(TreeId, KeyHash, MapRevision),
   FOREIGN KEY(TreeId) REFERENCES Trees(TreeId) ON DELETE CASCADE
 );
@@ -147,10 +150,11 @@ CREATE TABLE IF NOT EXISTS MapHead(
   MapHeadTimestamp     BIGINT,
   RootHash             VARBINARY(255) NOT NULL,
   MapRevision          BIGINT,
-  RootSignature        VARBINARY(255) NOT NULL,
-  MapperData           BLOB,
+  RootSignature        VARBINARY(1024) NOT NULL,
+  MapperData           MEDIUMBLOB,
   PRIMARY KEY(TreeId, MapHeadTimestamp),
-  UNIQUE INDEX TreeRevisionIdx(TreeId, MapRevision),
   FOREIGN KEY(TreeId) REFERENCES Trees(TreeId) ON DELETE CASCADE
 );
 
+CREATE UNIQUE INDEX MapHeadRevisionIdx
+  ON MapHead(TreeId, MapRevision);
